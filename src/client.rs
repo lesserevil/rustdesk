@@ -89,6 +89,7 @@ use crate::ui_session_interface::SessionPermissionConfig;
 
 pub use super::lang::*;
 
+pub mod ctap_local;
 pub mod file_trait;
 pub mod helper;
 pub mod io_loop;

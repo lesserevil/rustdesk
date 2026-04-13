@@ -1,0 +1,9 @@
+# RustDesk CTAP Passthrough - Virtual FIDO Device
+# Allows RustDesk to create virtual FIDO authenticators via /dev/uhid
+
+# Grant access to /dev/uhid for the rustdesk group
+KERNEL=="uhid", MODE="0660", GROUP="rustdesk"
+
+# Grant access to the virtual FIDO hidraw device created by RustDesk
+# VID 1209 (pid.codes open-source), PID F1D0 (RustDesk FIDO)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="f1d0", MODE="0664", GROUP="plugdev"

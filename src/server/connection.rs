@@ -38,7 +38,7 @@ use hbb_common::{
     sleep, timeout,
     tokio::{
         net::TcpStream,
-        sync::mpsc,
+        sync::{mpsc, oneshot},
         time::{self, Duration, Instant},
     },
     tokio_util::codec::{BytesCodec, Framed},
@@ -241,6 +241,9 @@ pub struct Connection {
     restart: bool,
     recording: bool,
     block_input: bool,
+    ctap: bool,
+    ctap_tx: Option<mpsc::UnboundedSender<CtapFrame>>,
+    ctap_shutdown: Option<oneshot::Sender<()>>,
     control_permissions: Option<ControlPermissions>,
     last_test_delay: Option<Instant>,
     network_delay: u32,
@@ -431,6 +434,9 @@ impl Connection {
             restart: Self::permission(keys::OPTION_ENABLE_REMOTE_RESTART, &control_permissions),
             recording: Self::permission(keys::OPTION_ENABLE_RECORD_SESSION, &control_permissions),
             block_input: Self::permission(keys::OPTION_ENABLE_BLOCK_INPUT, &control_permissions),
+            ctap: Self::permission(keys::OPTION_ENABLE_CTAP, &control_permissions),
+            ctap_tx: None,
+            ctap_shutdown: None,
             control_permissions,
             last_test_delay: None,
             network_delay: 0,
@@ -526,6 +532,9 @@ impl Connection {
         }
         if !conn.block_input {
             conn.send_permission(Permission::BlockInput, false).await;
+        }
+        if !conn.ctap {
+            conn.send_permission(Permission::Ctap, false).await;
         }
         let mut test_delay_timer =
             crate::rustdesk_interval(time::interval_at(Instant::now(), TEST_DELAY_TIMEOUT));
@@ -674,6 +683,12 @@ impl Connection {
                             } else if &name == "block_input" {
                                 conn.block_input = enabled;
                                 conn.send_permission(Permission::BlockInput, enabled).await;
+                            } else if &name == "ctap" {
+                                conn.ctap = enabled;
+                                conn.send_permission(Permission::Ctap, enabled).await;
+                                if !enabled {
+                                    conn.stop_ctap_service().await;
+                                }
                             }
                         }
                         ipc::Data::RawMessage(bytes) => {
@@ -1564,6 +1579,9 @@ impl Connection {
         if !platform_additions.is_empty() {
             pi.platform_additions = serde_json::to_string(&platform_additions).unwrap_or("".into());
         }
+
+        pi.ctap_passthrough_supported = self.ctap
+            && crate::server::ctap_virtual_device::is_virtual_device_available();
 
         if self.port_forward_socket.is_some() {
             let mut msg_out = Message::new();
@@ -3319,6 +3337,13 @@ impl Connection {
                             self.send(msg_out).await;
                         }
                     }
+                    Some(misc::Union::CtapControl(ctrl)) => {
+                        if ctrl.enabled && self.ctap {
+                            self.start_ctap_service().await;
+                        } else {
+                            self.stop_ctap_service().await;
+                        }
+                    }
                     _ => {}
                 },
                 Some(message::Union::AudioFrame(frame)) => {
@@ -3362,6 +3387,19 @@ impl Connection {
                     allow_err!(self.handle_terminal_action(action).await);
                     #[cfg(any(target_os = "android", target_os = "ios"))]
                     log::warn!("Terminal action received but not supported on this platform");
+                }
+                Some(message::Union::CtapFrame(frame)) => {
+                    if frame.is_response {
+                        // Response from client — forward to CTAP service
+                        if let Some(tx) = &self.ctap_tx {
+                            if tx.send(frame).is_err() {
+                                log::warn!("CTAP service channel closed");
+                                self.stop_ctap_service().await;
+                            }
+                        }
+                    } else {
+                        log::warn!("Received non-response CtapFrame from client (unexpected)");
+                    }
                 }
                 _ => {}
             }
@@ -4275,6 +4313,7 @@ impl Connection {
         // We can add a (Vec<conn_id>, input device) to avoid this.
         // But it's not necessary now and we have to consider two audio services(client, server).
         crate::audio_service::set_voice_call_input_device(None, true);
+        self.stop_ctap_service().await;
         log::info!("#{} Connection closed: {}", self.inner.id(), reason);
         if lock && self.lock_after_session_end && self.keyboard {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -4304,6 +4343,62 @@ impl Connection {
         msg_out.set_misc(misc);
         self.send(msg_out).await;
         raii::AuthedConnID::check_remove_session(self.inner.id(), self.session_key());
+    }
+
+    async fn start_ctap_service(&mut self) {
+        if self.ctap_tx.is_some() {
+            log::debug!("CTAP service already running");
+            return;
+        }
+
+        let (tx_to_service, rx_from_peer) = mpsc::unbounded_channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        // The CTAP service sends CtapFrame messages to us; we forward them to the client.
+        let (service_tx, mut service_rx) = mpsc::unbounded_channel::<CtapFrame>();
+
+        self.ctap_tx = Some(tx_to_service);
+        self.ctap_shutdown = Some(shutdown_tx);
+
+        // Forward CtapFrame messages from the CTAP service to the peer
+        if let Some(tx) = self.inner.tx.clone() {
+            tokio::spawn(async move {
+                while let Some(frame) = service_rx.recv().await {
+                    let mut msg_out = Message::new();
+                    msg_out.set_ctap_frame(frame);
+                    let _ = tx.send((
+                        Instant::now().into(),
+                        std::sync::Arc::new(msg_out),
+                    ));
+                }
+            });
+        }
+
+        tokio::spawn(async move {
+            if let Err(e) = crate::server::ctap_service::run_ctap_service(
+                service_tx,
+                rx_from_peer,
+                shutdown_rx,
+                Default::default(),
+            )
+            .await
+            {
+                log::error!("CTAP service error: {}", e);
+            }
+        });
+
+        log::info!(
+            "CTAP passthrough service started for connection #{}",
+            self.inner.id()
+        );
+    }
+
+    async fn stop_ctap_service(&mut self) {
+        if let Some(shutdown) = self.ctap_shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.ctap_tx = None;
+        log::debug!("CTAP passthrough service stopped");
     }
 
     async fn handle_read_job_init_result(

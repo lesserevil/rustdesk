@@ -1,0 +1,17 @@
+[package]
+name = "ctap-companion"
+version = "0.1.0"
+edition = "2021"
+description = "RustDesk CTAP Companion — bridges FIDO2 security keys to the RustDesk web client"
+
+[dependencies]
+ctap-common = { path = "../libs/ctap-common" }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }

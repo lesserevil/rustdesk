@@ -67,6 +67,14 @@ pub mod input_service {
 }
 
 mod connection;
+pub mod ctap_virtual_device;
+#[cfg(target_os = "linux")]
+pub mod ctap_uhid;
+#[cfg(target_os = "windows")]
+pub mod ctap_vhf;
+#[cfg(target_os = "macos")]
+pub mod ctap_driverkit;
+pub mod ctap_service;
 pub mod display_service;
 #[cfg(windows)]
 pub mod portable_service;

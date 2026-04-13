@@ -78,6 +78,7 @@ pub struct Remote<T: InvokeUiSession> {
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
     sent_close_reason: bool,
+    ctap_cancel_tx: Option<std::sync::mpsc::Sender<()>>,
 }
 
 #[derive(Default)]
@@ -127,6 +128,7 @@ impl<T: InvokeUiSession> Remote<T> {
             chroma: Default::default(),
             last_record_state: false,
             sent_close_reason: false,
+            ctap_cancel_tx: None,
         }
     }
 
@@ -2048,10 +2050,45 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                     self.handler.handle_terminal_response(response);
                 }
+                Some(message::Union::CtapFrame(frame)) => {
+                    if !frame.is_response {
+                        if frame.command == ctap_common::ctap_hid::CTAPHID_CANCEL as u32 {
+                            // Cancel from remote
+                            if let Some(tx) = self.ctap_cancel_tx.take() {
+                                let _ = tx.send(());
+                            }
+                        } else {
+                            // CTAP request from remote — relay to local key
+                            self.handle_ctap_request(frame, peer).await;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
         true
+    }
+
+    async fn handle_ctap_request(&mut self, frame: CtapFrame, _peer: &mut Stream) {
+        log::info!("CTAP request received from remote, relaying to local key");
+
+        // Create cancellation channel
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+        self.ctap_cancel_tx = Some(cancel_tx);
+
+        // Spawn async relay task
+        let sender = self.sender.clone();
+        let payload = frame.payload.to_vec();
+
+        tokio::spawn(async move {
+            let response =
+                crate::client::ctap_local::relay_to_physical_key(payload, cancel_rx).await;
+
+            // Send response back to remote
+            let mut msg = Message::new();
+            msg.set_ctap_frame(response);
+            let _ = sender.send(Data::Message(msg));
+        });
     }
 
     fn set_peer_info(&mut self, pi: &PeerInfo) {
