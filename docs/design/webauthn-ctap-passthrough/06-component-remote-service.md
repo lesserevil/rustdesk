@@ -122,8 +122,8 @@ pub async fn run_ctap_service(
 ```rust
 // src/server/ctap_service.rs
 
-use crate::ctap_hid::*;
-use crate::server::ctap_uhid::VirtualFidoDevice;
+use crate::server::ctap_virtual_device::{self, VirtualFidoDevice};
+use ctap_common::ctap_hid::*;
 use hbb_common::{
     allow_err, bail, log,
     message_proto::*,
@@ -138,8 +138,8 @@ pub async fn run_ctap_service(
     mut shutdown: oneshot::Receiver<()>,
     config: CtapServiceConfig,
 ) -> ResultType<()> {
-    // Step 1: Create virtual device
-    let device = VirtualFidoDevice::new()?;
+    // Step 1: Create virtual device (platform-specific: uhid on Linux, VHF on Windows)
+    let device = ctap_virtual_device::create_virtual_fido_device()?;
     log::info!("CTAP service started, virtual FIDO device created");
 
     // Step 2: Initialize state
@@ -173,7 +173,7 @@ four branches:
 
 ```rust
 async fn run_event_loop(
-    device: &VirtualFidoDevice,
+    device: &dyn VirtualFidoDevice,
     tx_to_peer: &mpsc::UnboundedSender<Message>,
     rx_from_peer: &mut mpsc::UnboundedReceiver<CtapFrame>,
     shutdown: &mut oneshot::Receiver<()>,
@@ -244,7 +244,7 @@ async fn run_event_loop(
 ```rust
 async fn handle_uhid_report(
     report: &[u8; 64],
-    device: &VirtualFidoDevice,
+    device: &dyn VirtualFidoDevice,
     tx_to_peer: &mpsc::UnboundedSender<Message>,
     assembler: &mut CtapHidAssembler,
     next_cid: &mut u32,
@@ -418,7 +418,7 @@ async fn handle_client_response(
 ### Step 6: Helper to send CTAPHID messages
 
 ```rust
-fn send_ctaphid(device: &VirtualFidoDevice, msg: &CtapHidMessage) -> ResultType<()> {
+fn send_ctaphid(device: &dyn VirtualFidoDevice, msg: &CtapHidMessage) -> ResultType<()> {
     let packets = fragment(msg)?;
     for pkt in &packets {
         device.write_input_report(pkt)?;
@@ -426,7 +426,7 @@ fn send_ctaphid(device: &VirtualFidoDevice, msg: &CtapHidMessage) -> ResultType<
     Ok(())
 }
 
-fn send_error(device: &VirtualFidoDevice, cid: u32, code: u8) -> ResultType<()> {
+fn send_error(device: &dyn VirtualFidoDevice, cid: u32, code: u8) -> ResultType<()> {
     let msg = CtapHidMessage::error(cid, code);
     send_ctaphid(device, &msg)
 }

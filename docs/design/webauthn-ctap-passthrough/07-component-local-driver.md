@@ -1,9 +1,9 @@
-# 07 - Component: Local Authenticator Driver
+# 07 - Component: Local Authenticator Driver (Native Client)
 
 **Assignee**: Developer D
 **Estimated effort**: 1-2 weeks
 **Dependencies**: Component 03 (protobuf), Component 05 (CTAPHID framing)
-**New file**: `src/client/ctap_local.rs`
+**New files**: `src/client/ctap_local.rs`, `libs/ctap-common/src/fido_relay.rs`
 **New dependency**: `hidapi = { version = "2.6", features = ["linux-native"] }`
 
 ## Background
@@ -19,6 +19,31 @@ This component handles:
 3. Sending CTAPHID_CBOR commands to the physical key
 4. Receiving responses (including handling KEEPALIVE from the key)
 5. Reporting errors back to the remote service
+
+## Relationship to the Companion App (Component 13)
+
+This component is for the **native RustDesk client**. The **web client** uses the
+CTAP Companion App ([13-component-companion-app.md](13-component-companion-app.md))
+instead, which provides the same FIDO relay logic over a localhost WebSocket.
+
+The core relay logic (`LocalAuthenticator`, `relay_command`, channel allocation,
+HID read/write) is extracted into a shared library crate `libs/ctap-common/` so
+that both this component and the companion app use the same code. The native
+client's `ctap_local.rs` is a thin wrapper that calls `ctap-common` and integrates
+with `io_loop.rs`. The companion app's `fido_relay.rs` calls the same `ctap-common`
+functions and integrates with the WebSocket server.
+
+```
+libs/ctap-common/
+    src/
+        lib.rs
+        ctap_hid.rs       # CTAPHID framing (moved from Component 05)
+        fido_relay.rs      # LocalAuthenticator, relay_command, HID I/O
+
+src/client/ctap_local.rs   # Native client wrapper: spawn_blocking + io_loop integration
+ctap-companion/src/
+    fido_relay.rs           # Companion wrapper: WebSocket ↔ ctap-common bridge
+```
 
 ## Device Discovery
 
@@ -37,25 +62,49 @@ flowchart TD
     G -->|User cancelled| I
 ```
 
+## Platform Support
+
+The local authenticator driver supports **Linux, Windows, and macOS**. The `hidapi`
+crate provides a cross-platform HID API with platform-specific backends:
+
+| Platform | hidapi Backend | Discovery Method | Notes |
+|----------|---------------|------------------|-------|
+| Linux | hidraw (native) | Usage page 0xF1D0 via hidraw | Requires `linux-native` feature |
+| Windows | Windows HID API | Usage page 0xF1D0 via `HidP_GetCaps` | Works out of the box |
+| macOS | IOHidManager | Usage page 0xF1D0 via IOKit | Works out of the box |
+
 ## Dependencies
 
 ### hidapi Crate
 
-Add to `Cargo.toml`:
+Add to `Cargo.toml` (in the `ctap-common` shared library):
 
 ```toml
+# libs/ctap-common/Cargo.toml
+[dependencies]
+hidapi = "2.6"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 hidapi = { version = "2.6", features = ["linux-native"] }
 ```
 
-**Why `linux-native` feature**: The default hidapi backend on Linux uses libusb,
+**Linux `linux-native` feature**: The default hidapi backend on Linux uses libusb,
 which cannot read HID usage pages. The `linux-native` feature uses the hidraw
 backend directly, which supports `usage_page()` filtering — essential for finding
-FIDO devices.
+FIDO devices. On Windows and macOS, the default backend already supports usage page
+filtering.
 
 **Why NOT `ctap-hid-fido2` or `libfido2`**: These crates provide higher-level
 FIDO2 APIs that own the CTAP protocol parsing. We want raw CTAPHID-level access
 because we are forwarding opaque CBOR payloads, not interpreting them.
+
+### Platform-Specific Permissions
+
+| Platform | Requirement |
+|----------|------------|
+| Linux | User in `plugdev` group, or udev rules granting hidraw access |
+| Windows | No special permissions — USB HID devices are user-accessible by default |
+| macOS | App must have `com.apple.security.device.usb` entitlement if sandboxed; unsigned apps work without restriction |
 
 ## API Design
 
@@ -154,6 +203,11 @@ impl LocalAuthenticator {
     }
 }
 ```
+
+**Cross-platform note**: `usage_page()` filtering works on all three platforms:
+- Linux (hidraw backend): reads usage page from the sysfs report descriptor
+- Windows: reads usage page via `HidP_GetCaps` / `HidP_GetValueCaps`
+- macOS: reads usage page via IOKit `kIOHIDPrimaryUsagePageKey`
 
 **IMPORTANT**: `HidApi::new()` enumerates all devices, which takes ~10-50ms.
 Do not call it in a hot loop. Open the device once per CTAP transaction.
@@ -503,4 +557,6 @@ See [11-testing.md](11-testing.md) for tests requiring a physical security key.
 - [ ] Cancellation signal terminates the relay and sends CTAPHID_CANCEL to the key
 - [ ] `relay_to_physical_key()` runs on a blocking thread (doesn't block async runtime)
 - [ ] Device is opened fresh per transaction (handles hot-plug)
-- [ ] Code compiles only on Linux (`#[cfg(target_os = "linux")]`)
+- [ ] Code compiles and works on Linux, Windows, and macOS
+- [ ] Usage page filtering (0xF1D0) works on all three platforms
+- [ ] HID report write prepends 0x00 report ID on all platforms (hidapi requirement)

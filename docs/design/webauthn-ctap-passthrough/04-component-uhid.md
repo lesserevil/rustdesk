@@ -1,26 +1,98 @@
-# 04 - Component: Virtual FIDO Device (uhid)
+# 04 - Component: Virtual FIDO Device
 
-**Assignee**: Developer B
-**Estimated effort**: 1-2 weeks
+**Assignee**: Developer B (Linux), Developer F (Windows), Developer G (macOS)
+**Estimated effort**: 1-2 weeks (Linux), 3-4 weeks (Windows), 3-4 weeks (macOS)
 **Dependencies**: Component 03 (protobuf messages)
-**New file**: `src/server/ctap_uhid.rs`
+**New files**:
+- `src/server/ctap_virtual_device.rs` — platform abstraction trait
+- `src/server/ctap_uhid.rs` — Linux implementation via `/dev/uhid`
+- `src/server/ctap_vhf.rs` — Windows implementation via Virtual HID Framework
+- `src/server/ctap_driverkit.rs` — macOS implementation via DriverKit
+- `RustDeskFIDO/` — macOS DriverKit system extension project
 
 ## Background
 
-On Linux, `/dev/uhid` allows user-space programs to create virtual HID devices.
-Writing a `UHID_CREATE2` event creates a kernel HID device. The kernel's HID
-subsystem reads the device's report descriptor and, if it sees the FIDO Alliance
-usage page (0xF1D0), creates a `/dev/hidrawN` node that browsers discover as a
-FIDO authenticator.
+The remote CTAP service needs to present a virtual FIDO authenticator to the
+operating system's HID subsystem. Browsers discover this device and send CTAPHID
+commands to it, which the service intercepts and tunnels to the client.
 
-This component creates and manages the virtual FIDO device lifecycle.
+Each supported remote platform achieves this differently:
+
+| Platform | Mechanism | Interface | Browser Discovery |
+|----------|-----------|-----------|-------------------|
+| Linux | uhid | `/dev/uhid` → `/dev/hidrawN` | Browsers scan hidraw for FIDO usage page |
+| Windows | VHF (Virtual HID Framework) | UMDF2 driver → HID minidriver | Browsers use Windows WebAuthn API / HID class |
+| macOS | DriverKit (`IOUserHIDDevice`) | System extension → IOKit HID | Browsers use IOKit HID manager for FIDO usage page |
+
+## Platform Abstraction Trait
+
+All three implementations expose the same interface to the CTAP service (Component 06):
+
+```rust
+// src/server/ctap_virtual_device.rs
+
+use hbb_common::ResultType;
+
+/// Platform-agnostic interface for a virtual FIDO HID device.
+///
+/// The CTAP service (Component 06) uses this trait exclusively. It does not
+/// depend on uhid or VHF types directly.
+#[async_trait::async_trait]
+pub trait VirtualFidoDevice: Send {
+    /// Read the next 64-byte output report from the browser.
+    ///
+    /// Blocks (async) until the browser sends a CTAPHID packet to the virtual
+    /// device. Returns the raw 64-byte HID report.
+    async fn read_output_report(&self) -> ResultType<[u8; 64]>;
+
+    /// Write a 64-byte input report to the browser.
+    ///
+    /// Sends a CTAPHID response packet to the browser.
+    fn write_input_report(&self, report: &[u8; 64]) -> ResultType<()>;
+
+    /// Destroy the virtual device and clean up.
+    fn destroy(&self) -> ResultType<()>;
+}
+
+/// Create a virtual FIDO device using the platform-appropriate mechanism.
+///
+/// - Linux: creates via /dev/uhid
+/// - Windows: creates via VHF driver
+/// - macOS: creates via DriverKit IOUserHIDDevice
+pub fn create_virtual_fido_device() -> ResultType<Box<dyn VirtualFidoDevice>> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(crate::server::ctap_uhid::UhidFidoDevice::new()?))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Box::new(crate::server::ctap_vhf::VhfFidoDevice::new()?))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(crate::server::ctap_driverkit::DriverKitFidoDevice::new()?))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        hbb_common::bail!("Virtual FIDO device not supported on this platform");
+    }
+}
+```
 
 ## Prerequisites
 
 Before writing code, read:
-- Linux kernel docs: https://www.kernel.org/doc/html/latest/hid/uhid.html
-- The existing `src/server/uinput.rs` — it creates virtual keyboard/mouse devices
-  via a similar kernel interface (`/dev/uinput`). Study its device creation pattern.
+- **Linux**: kernel docs: https://www.kernel.org/doc/html/latest/hid/uhid.html
+  and the existing `src/server/uinput.rs` (virtual keyboard/mouse via `/dev/uinput`)
+- **Windows**: Microsoft VHF docs: https://learn.microsoft.com/en-us/windows-hardware/drivers/hid/virtual-hid-framework--vhf-
+  and UMDF2 driver development: https://learn.microsoft.com/en-us/windows-hardware/drivers/wdf/getting-started-with-umdf-version-2
+- **macOS**: DriverKit overview: https://developer.apple.com/documentation/driverkit
+  and HIDDriverKit: https://developer.apple.com/documentation/hiddriverkit
+  and `IOUserHIDDevice`: https://developer.apple.com/documentation/hiddriverkit/iouserhiddevice
+
+---
+
+# Part A: Linux Implementation (uhid)
 
 ## Requirements
 
@@ -164,12 +236,13 @@ just use 4380 to be safe).
 
 ```rust
 /// Handle to a virtual FIDO device created via /dev/uhid.
-pub struct VirtualFidoDevice {
+/// Implements the VirtualFidoDevice trait (see ctap_virtual_device.rs).
+pub struct UhidFidoDevice {
     /// The /dev/uhid file descriptor, wrapped for async I/O.
     fd: tokio::io::unix::AsyncFd<std::fs::File>,
 }
 
-impl VirtualFidoDevice {
+impl UhidFidoDevice {
     /// Create a new virtual FIDO device.
     ///
     /// Opens /dev/uhid, writes a UHID_CREATE2 event with the FIDO HID report
@@ -179,36 +252,16 @@ impl VirtualFidoDevice {
     /// - Permission denied if /dev/uhid is not accessible
     /// - I/O error if the kernel rejects the create request
     pub fn new() -> ResultType<Self>;
-
-    /// Read the next output report from the browser.
-    ///
-    /// Blocks (async) until the browser sends a CTAPHID packet to the virtual
-    /// device. Returns the raw 64-byte HID report.
-    ///
-    /// Also handles UHID_OPEN/UHID_CLOSE/UHID_START/UHID_STOP events internally
-    /// (logs them, does not return them to the caller).
-    ///
-    /// # Returns
-    /// - Ok(report): 64-byte HID output report from the browser
-    /// - Err if the device was destroyed or an I/O error occurred
-    pub async fn read_output_report(&self) -> ResultType<[u8; 64]>;
-
-    /// Write an input report to the browser.
-    ///
-    /// Sends a 64-byte CTAPHID packet to the browser via UHID_INPUT2.
-    ///
-    /// # Arguments
-    /// - `report`: Exactly 64 bytes of HID report data
-    pub fn write_input_report(&self, report: &[u8; 64]) -> ResultType<()>;
-
-    /// Destroy the virtual device and clean up.
-    ///
-    /// Sends UHID_DESTROY and closes the file descriptor.
-    /// Called automatically on Drop, but can be called explicitly.
-    pub fn destroy(&self) -> ResultType<()>;
 }
 
-impl Drop for VirtualFidoDevice {
+#[async_trait::async_trait]
+impl VirtualFidoDevice for UhidFidoDevice {
+    async fn read_output_report(&self) -> ResultType<[u8; 64]>;
+    fn write_input_report(&self, report: &[u8; 64]) -> ResultType<()>;
+    fn destroy(&self) -> ResultType<()>;
+}
+
+impl Drop for UhidFidoDevice {
     fn drop(&mut self) {
         let _ = self.destroy();
     }
@@ -230,7 +283,7 @@ use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use hbb_common::{bail, log, ResultType};
 
-impl VirtualFidoDevice {
+impl UhidFidoDevice {
     pub fn new() -> ResultType<Self> {
         // 1. Open /dev/uhid
         let file = OpenOptions::new()
@@ -344,7 +397,7 @@ requires careful alignment verification.
 ### Step 3: Implement read_output_report
 
 ```rust
-impl VirtualFidoDevice {
+impl UhidFidoDevice {
     pub async fn read_output_report(&self) -> ResultType<[u8; 64]> {
         loop {
             // Wait for the fd to become readable
@@ -418,7 +471,7 @@ impl VirtualFidoDevice {
 ### Step 4: Implement write_input_report
 
 ```rust
-impl VirtualFidoDevice {
+impl UhidFidoDevice {
     pub fn write_input_report(&self, report: &[u8; 64]) -> ResultType<()> {
         // Build UHID_INPUT2 event
         let mut event_buf = vec![0u8; 4 + 2 + UHID_DATA_MAX];
@@ -445,7 +498,7 @@ impl VirtualFidoDevice {
 ### Step 5: Implement destroy
 
 ```rust
-impl VirtualFidoDevice {
+impl UhidFidoDevice {
     pub fn destroy(&self) -> ResultType<()> {
         let mut event_buf = vec![0u8; 4 + UHID_EVENT_PAYLOAD_SIZE];
         event_buf[0..4].copy_from_slice(&UHID_DESTROY.to_ne_bytes());
@@ -506,19 +559,24 @@ virtual device from both sides.
 | Short read from uhid | Kernel bug or fd closed | Return error, service will restart |
 | Unexpected report size (!= 64) | Malformed CTAPHID packet | Log warning, skip packet |
 
-## Platform Notes
+## Linux Platform Notes
 
-- This component is **Linux-only**. Gate with `#[cfg(target_os = "linux")]`.
+- Gate with `#[cfg(target_os = "linux")]`.
 - `/dev/uhid` requires the `uhid` kernel module (loaded by default on most distros).
-- The file should be conditionally compiled. In `src/server/mod.rs`:
+- In `src/server/mod.rs`:
   ```rust
+  pub mod ctap_virtual_device; // Platform abstraction trait (all platforms)
   #[cfg(target_os = "linux")]
   pub mod ctap_uhid;
+  #[cfg(target_os = "windows")]
+  pub mod ctap_vhf;
+  #[cfg(target_os = "macos")]
+  pub mod ctap_driverkit;
   ```
 
-## Acceptance Criteria
+## Linux Acceptance Criteria
 
-- [ ] `VirtualFidoDevice::new()` creates a virtual device visible in `/sys/class/hidraw/`
+- [ ] `UhidFidoDevice::new()` creates a virtual device visible in `/sys/class/hidraw/`
 - [ ] The device's HID report descriptor matches `FIDO_HID_REPORT_DESCRIPTOR`
 - [ ] `read_output_report()` returns 64-byte reports when a process writes to the hidraw device
 - [ ] `write_input_report()` delivers 64-byte reports to processes reading the hidraw device
@@ -526,4 +584,732 @@ virtual device from both sides.
 - [ ] Drop automatically destroys the device
 - [ ] All operations are async-compatible (work inside `tokio::select!`)
 - [ ] Struct size tests pass
-- [ ] Code compiles only on Linux (`#[cfg(target_os = "linux")]`)
+- [ ] Implements `VirtualFidoDevice` trait
+
+---
+
+# Part B: Windows Implementation (Virtual HID Framework)
+
+## Background
+
+Windows does not have a `/dev/uhid` equivalent in user space. Creating a virtual
+HID device requires a kernel-mode or UMDF2 (User-Mode Driver Framework v2) driver
+that registers with the Windows HID class driver via the **Virtual HID Framework
+(VHF)**.
+
+### How Browsers Find FIDO Devices on Windows
+
+On Windows 10 1903+, the FIDO device discovery path differs from Linux:
+
+```mermaid
+flowchart TD
+    B[Browser] -->|"WebAuthn API call"| WA["webauthn.dll\n(Windows WebAuthn API)"]
+    WA -->|"Enumerates"| HID["HID Class Driver\n(hidclass.sys)"]
+    HID -->|"Finds"| VHF["VHF Virtual Device\n(our driver)"]
+    VHF -->|"Reports"| RD["FIDO Report Descriptor\nUsage Page 0xF1D0"]
+```
+
+- **Chrome 100+, Edge**: Always use `webauthn.dll` → Windows HID class
+- **Firefox**: Uses its own HID stack by default (`security.webauthn.enable_usbtoken`),
+  but can be configured to use `webauthn.dll`. Both paths discover HID devices
+  through the Windows HID class driver.
+- **Key point**: Both paths ultimately go through the Windows HID class driver,
+  so a VHF virtual device is visible to all browsers.
+
+### VHF Architecture
+
+```mermaid
+flowchart TD
+    subgraph UserSpace["User Space"]
+        SVC["RustDesk CTAP Service\n(ctap_service.rs)"]
+        IOCTL["DeviceIoControl\ncalls to VHF driver"]
+    end
+
+    subgraph KernelSpace["Kernel Space"]
+        UMDF["VHF UMDF2 Driver\n(rustdesk_vhf.dll)"]
+        VHF["Virtual HID Framework\n(vhf.sys)"]
+        HIDCLASS["HID Class Driver\n(hidclass.sys)"]
+    end
+
+    subgraph Browser
+        WEBAUTHN["webauthn.dll"]
+    end
+
+    SVC --> IOCTL
+    IOCTL --> UMDF
+    UMDF -->|"VhfCreate\nVhfReadReportSubmit"| VHF
+    VHF --> HIDCLASS
+    HIDCLASS --> WEBAUTHN
+    WEBAUTHN --> Browser
+```
+
+The UMDF2 driver runs in a user-mode host process (`WUDFHost.exe`) but has
+kernel-level access to the HID class driver via VHF APIs.
+
+## VHF Driver Design
+
+### Driver Overview
+
+The driver is a minimal UMDF2 driver that:
+1. Creates a virtual HID device via `VhfCreate()` with the FIDO report descriptor
+2. Receives output reports (browser → device) via a `VHF_CONFIG.EvtVhfReadyForNextReadHidReport` callback
+3. Submits input reports (device → browser) via `VhfReadReportSubmit()`
+4. Communicates with the RustDesk user-space service via a custom device interface (IOCTLs)
+
+### Driver Files
+
+```
+src/platform/windows/vhf_driver/
+    rustdesk_vhf.inf          # Driver installation INF
+    rustdesk_vhf.c             # UMDF2 driver entry point and VHF callbacks
+    device.h                   # Device context, IOCTL definitions
+    Makefile / .vcxproj        # Build using WDK (Windows Driver Kit)
+```
+
+### IOCTL Interface
+
+The user-space CTAP service communicates with the VHF driver via
+`DeviceIoControl()` on a device handle obtained from `CreateFile()` on the
+driver's device interface:
+
+| IOCTL | Direction | Data | Description |
+|-------|-----------|------|-------------|
+| `IOCTL_RUSTDESK_VHF_READ_REPORT` | Driver → User | 64-byte HID report | Read the next output report from the browser. Blocks (pending IRP) until a report is available. |
+| `IOCTL_RUSTDESK_VHF_WRITE_REPORT` | User → Driver | 64-byte HID report | Submit an input report to the browser. |
+| `IOCTL_RUSTDESK_VHF_GET_STATUS` | Driver → User | Status flags | Check if the device is active (browser has opened it). |
+
+```c
+// device.h
+#define FILE_DEVICE_RUSTDESK_VHF  0x8000  // Private device type
+
+#define IOCTL_RUSTDESK_VHF_READ_REPORT \
+    CTL_CODE(FILE_DEVICE_RUSTDESK_VHF, 0x800, METHOD_BUFFERED, FILE_READ_ACCESS)
+
+#define IOCTL_RUSTDESK_VHF_WRITE_REPORT \
+    CTL_CODE(FILE_DEVICE_RUSTDESK_VHF, 0x801, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
+#define IOCTL_RUSTDESK_VHF_GET_STATUS \
+    CTL_CODE(FILE_DEVICE_RUSTDESK_VHF, 0x802, METHOD_BUFFERED, FILE_READ_ACCESS)
+```
+
+### Driver VHF Callbacks
+
+```c
+// rustdesk_vhf.c (simplified)
+
+NTSTATUS EvtVhfAsyncOperationGetFeature(PVOID VhfClientContext, PHID_XFER_PACKET HidTransferPacket, ...) {
+    // Not used for FIDO — return STATUS_NOT_SUPPORTED
+}
+
+VOID EvtVhfAsyncOperationWriteReport(PVOID VhfClientContext, HID_XFER_PACKET* HidTransferPacket, ...) {
+    // Browser sent an output report (CTAPHID packet)
+    // Copy the 64-byte report into a pending-read queue
+    // Complete any pending IOCTL_RUSTDESK_VHF_READ_REPORT IRP
+    PDEVICE_CONTEXT ctx = (PDEVICE_CONTEXT)VhfClientContext;
+    EnqueueOutputReport(ctx, HidTransferPacket->reportBuffer, HidTransferPacket->reportBufferLen);
+}
+
+// Called by user space via IOCTL_RUSTDESK_VHF_WRITE_REPORT:
+VOID SubmitInputReport(PDEVICE_CONTEXT ctx, PUCHAR reportBuffer, ULONG reportLen) {
+    VHF_HID_READ_REPORT_PARAMS params = { ... };
+    VhfReadReportSubmit(ctx->VhfHandle, &params);
+}
+```
+
+## Rust User-Space Integration
+
+### VhfFidoDevice
+
+```rust
+// src/server/ctap_vhf.rs
+
+use std::os::windows::io::OwnedHandle;
+use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_FLAG_OVERLAPPED};
+use windows::Win32::System::IO::DeviceIoControl;
+
+/// Handle to a virtual FIDO device created via the RustDesk VHF driver.
+/// Implements the VirtualFidoDevice trait.
+pub struct VhfFidoDevice {
+    /// Handle to the VHF driver's device interface
+    device: OwnedHandle,
+}
+
+impl VhfFidoDevice {
+    pub fn new() -> ResultType<Self> {
+        // 1. Find the device interface using SetupDiGetClassDevs + SetupDiEnumDeviceInterfaces
+        // 2. Open with CreateFileW (FILE_FLAG_OVERLAPPED for async)
+        // 3. The VHF driver creates the virtual HID device on open
+        todo!()
+    }
+}
+
+#[async_trait::async_trait]
+impl VirtualFidoDevice for VhfFidoDevice {
+    async fn read_output_report(&self) -> ResultType<[u8; 64]> {
+        // Issue IOCTL_RUSTDESK_VHF_READ_REPORT via overlapped I/O
+        // The IOCTL blocks (pends) until the browser sends a report
+        // Use tokio::io::windows::NamedPipeClient or a manual OVERLAPPED + event
+        todo!()
+    }
+
+    fn write_input_report(&self, report: &[u8; 64]) -> ResultType<()> {
+        // Issue IOCTL_RUSTDESK_VHF_WRITE_REPORT
+        todo!()
+    }
+
+    fn destroy(&self) -> ResultType<()> {
+        // Close the device handle — driver destroys the virtual device
+        // (handled by OwnedHandle Drop)
+        Ok(())
+    }
+}
+
+/// Check if the VHF driver is installed and accessible.
+pub fn is_driver_available() -> bool {
+    // Use SetupDiGetClassDevs to check if the device interface GUID exists
+    // This is called by is_ctap_available() in config
+    todo!()
+}
+```
+
+### Async I/O on Windows
+
+Unlike Linux's `AsyncFd`, Windows uses overlapped I/O for async device operations.
+The pattern for async IOCTL:
+
+```rust
+async fn read_output_report(&self) -> ResultType<[u8; 64]> {
+    let mut report = [0u8; 64];
+    let mut overlapped = OVERLAPPED::default();
+    let event = CreateEventW(None, true, false, None)?;
+    overlapped.hEvent = event;
+
+    let result = DeviceIoControl(
+        self.device.as_raw_handle(),
+        IOCTL_RUSTDESK_VHF_READ_REPORT,
+        None, 0,                     // No input buffer
+        Some(report.as_mut_ptr() as _), 64, // Output buffer
+        None,                         // Bytes returned (via overlapped)
+        Some(&mut overlapped),
+    );
+
+    if !result.as_bool() {
+        let err = GetLastError();
+        if err == ERROR_IO_PENDING {
+            // Wait asynchronously for the IOCTL to complete
+            // Wrap the event in a tokio-compatible waiter
+            tokio::task::spawn_blocking(move || {
+                WaitForSingleObject(event, INFINITE);
+            }).await?;
+        } else {
+            bail!("DeviceIoControl failed: {:?}", err);
+        }
+    }
+
+    Ok(report)
+}
+```
+
+## Driver Deployment
+
+### Build Requirements
+
+- Windows Driver Kit (WDK) 10.0.22621 or later
+- Visual Studio 2022 with WDK integration
+- UMDF2 target (user-mode driver — simpler than KMDF)
+
+### Driver Signing
+
+Production drivers on Windows must be signed. Options:
+
+| Method | Requirement | Use Case |
+|--------|-------------|----------|
+| **Test signing** | Enable test signing mode on dev machines | Development only |
+| **Attestation signing** | EV code signing certificate + Microsoft Hardware Dashboard | Production (recommended) |
+| **WHQL** | Full HLK testing + Microsoft certification | Optional, highest trust |
+
+**Recommendation**: Use attestation signing via the Microsoft Partner Center.
+This requires an EV code signing certificate (~$200-400/year) and submission
+to the Hardware Dashboard. The signed driver works on all Windows 10/11 machines
+without test mode.
+
+### Installation
+
+The driver is packaged as a `.inf` + `.dll` pair and installed via:
+
+```powershell
+# Admin PowerShell
+pnputil /add-driver rustdesk_vhf.inf /install
+```
+
+Or bundled into the RustDesk MSI/NSIS installer, which calls `pnputil` during
+installation. The installer should also handle driver updates and removal.
+
+### Alternative: Driver-Free Approach (Future)
+
+Windows 11 24H2+ introduces the **Virtual USB (USBIP)** feature and potential
+user-mode HID creation APIs. If Microsoft exposes a user-mode API for virtual
+HID devices (similar to Linux uhid), the VHF driver could be replaced. Monitor
+Windows SDK releases for this.
+
+## Windows Acceptance Criteria
+
+- [ ] VHF UMDF2 driver builds with WDK
+- [ ] Driver creates a virtual HID device visible in Device Manager under "Human Interface Devices"
+- [ ] The device's HID report descriptor matches `FIDO_HID_REPORT_DESCRIPTOR`
+- [ ] `IOCTL_RUSTDESK_VHF_READ_REPORT` returns 64-byte reports from browser
+- [ ] `IOCTL_RUSTDESK_VHF_WRITE_REPORT` delivers 64-byte reports to browser
+- [ ] Device is destroyed when the user-space handle is closed
+- [ ] Chrome and Edge discover the virtual device via `webauthn.dll`
+- [ ] Firefox discovers the virtual device via its HID stack
+- [ ] `VhfFidoDevice` implements `VirtualFidoDevice` trait
+- [ ] `is_driver_available()` correctly detects driver presence
+- [ ] Driver is attestation-signed for production deployment
+- [ ] Driver installs cleanly via `pnputil` and via the RustDesk installer
+- [ ] Driver uninstalls cleanly (removes virtual device, removes driver package)
+
+---
+
+# Part C: macOS Implementation (DriverKit)
+
+## Background
+
+macOS 10.15 (Catalina) introduced **DriverKit**, a user-space driver framework
+that replaces kernel extensions (kexts). The **HIDDriverKit** subset provides
+`IOUserHIDDevice`, a base class for creating virtual HID devices from user space.
+
+This is architecturally equivalent to Linux uhid and Windows VHF — a virtual HID
+device that the OS HID subsystem exposes to applications (browsers) as if it were
+a physical USB device.
+
+### How Browsers Find FIDO Devices on macOS
+
+```mermaid
+flowchart TD
+    B["Browser (Chrome/Firefox/Safari)"] -->|"IOKit HID Manager"| HID["IOKit HID Subsystem"]
+    HID -->|"Matches usage page 0xF1D0"| DK["DriverKit System Extension\n(IOUserHIDDevice subclass)"]
+    DK -->|"handleReport / getReport"| SVC["RustDesk CTAP Service\n(via XPC / IOKit user client)"]
+```
+
+- **Chrome**: Uses IOKit `IOHIDManager` to enumerate HID devices, filters by
+  usage page 0xF1D0. Discovers DriverKit virtual devices.
+- **Firefox**: Same IOKit path for FIDO device discovery.
+- **Safari**: Uses the macOS platform authenticator API, which internally queries
+  IOKit for HID FIDO devices. Also discovers DriverKit virtual devices.
+
+### Why DriverKit (Not IOHIDUserDevice)
+
+macOS also has a private-ish C API, `IOHIDUserDevice`, that can create virtual
+HID devices without a full DriverKit extension. However:
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **DriverKit** (recommended) | Officially supported, future-proof, works with SIP enabled, App Store compatible | Requires Apple Developer account, entitlement request, Xcode project |
+| **IOHIDUserDevice** | Simpler to implement, no driver project needed | Semi-private API, may break on future macOS, may require SIP disable or special entitlement on recent macOS |
+
+We recommend DriverKit as the primary approach. IOHIDUserDevice may be used as a
+fallback for development/testing.
+
+## DriverKit System Extension
+
+### Project Structure
+
+The DriverKit extension is a separate Xcode target bundled inside the RustDesk
+app:
+
+```
+RustDeskFIDO/
+    RustDeskFIDO.xcodeproj
+    RustDeskFIDODriver/
+        Info.plist                  # DriverKit extension metadata
+        RustDeskFIDODriver.entitlements
+        RustDeskFIDODevice.h        # IOUserHIDDevice subclass declaration
+        RustDeskFIDODevice.cpp      # Implementation
+        RustDeskFIDODevice.iig      # IOKit Interface Generator file
+```
+
+The compiled extension lives at:
+```
+RustDesk.app/Contents/Library/SystemExtensions/
+    com.rustdesk.RustDeskFIDODriver.dext
+```
+
+### IOUserHIDDevice Subclass
+
+```cpp
+// RustDeskFIDODevice.h
+
+#include <HIDDriverKit/IOUserHIDDevice.iig>
+
+class RustDeskFIDODevice : public IOUserHIDDevice {
+public:
+    // DriverKit lifecycle
+    virtual bool init() override;
+    virtual kern_return_t Start(IOService *provider) override;
+    virtual kern_return_t Stop(IOService *provider) override;
+    virtual void free() override;
+
+    // HID device properties
+    virtual OSDictionary *newDeviceDescription() override;
+    virtual OSData *newReportDescriptor() override;
+
+    // Report handling
+    virtual kern_return_t getReport(IOMemoryDescriptor *report,
+                                     IOHIDReportType reportType,
+                                     IOOptionBits options,
+                                     uint32_t completionTimeout,
+                                     OSAction *action) override;
+
+    virtual kern_return_t setReport(IOMemoryDescriptor *report,
+                                     IOHIDReportType reportType,
+                                     IOOptionBits options,
+                                     uint32_t completionTimeout,
+                                     OSAction *action) override;
+};
+```
+
+### Key Callbacks
+
+**`newDeviceDescription()`** — Returns device properties:
+
+```cpp
+OSDictionary *RustDeskFIDODevice::newDeviceDescription() {
+    auto dict = OSDictionary::withCapacity(6);
+    // VID/PID matching the Linux/Windows virtual device
+    dict->setObject(kIOHIDVendorIDKey, OSNumber::withNumber(0x1209, 32));
+    dict->setObject(kIOHIDProductIDKey, OSNumber::withNumber(0xF1D0, 32));
+    dict->setObject(kIOHIDTransportKey, OSString::withCString("Virtual"));
+    dict->setObject(kIOHIDManufacturerKey, OSString::withCString("RustDesk"));
+    dict->setObject(kIOHIDProductKey,
+        OSString::withCString("RustDesk Virtual FIDO2 Authenticator"));
+    dict->setObject(kIOHIDVersionNumberKey, OSNumber::withNumber(0x100, 32));
+    return dict;
+}
+```
+
+**`newReportDescriptor()`** — Returns the FIDO HID report descriptor:
+
+```cpp
+OSData *RustDeskFIDODevice::newReportDescriptor() {
+    // Same 34-byte FIDO HID report descriptor as Linux/Windows
+    static const uint8_t descriptor[] = {
+        0x06, 0xD0, 0xF1,  // Usage Page (FIDO Alliance = 0xF1D0)
+        0x09, 0x01,         // Usage (U2F Authenticator Device)
+        0xA1, 0x01,         // Collection (Application)
+        0x09, 0x20,         //   Usage (Input Report Data)
+        0x15, 0x00,         //   Logical Minimum (0)
+        0x26, 0xFF, 0x00,   //   Logical Maximum (255)
+        0x75, 0x08,         //   Report Size (8)
+        0x95, 0x40,         //   Report Count (64)
+        0x81, 0x02,         //   Input (Data, Variable, Absolute)
+        0x09, 0x21,         //   Usage (Output Report Data)
+        0x15, 0x00,         //   Logical Minimum (0)
+        0x26, 0xFF, 0x00,   //   Logical Maximum (255)
+        0x75, 0x08,         //   Report Size (8)
+        0x95, 0x40,         //   Report Count (64)
+        0x91, 0x02,         //   Output (Data, Variable, Absolute)
+        0xC0,               // End Collection
+    };
+    return OSData::withBytes(descriptor, sizeof(descriptor));
+}
+```
+
+**`setReport()`** — Called when the browser sends an output report (CTAPHID packet):
+
+```cpp
+kern_return_t RustDeskFIDODevice::setReport(IOMemoryDescriptor *report, ...) {
+    // Read the 64-byte report from the IOMemoryDescriptor
+    // Enqueue it for the RustDesk user-space service to read via the user client
+    uint8_t buf[64];
+    report->readBytes(0, buf, 64);
+    enqueueOutputReport(buf, 64);
+    return kIOReturnSuccess;
+}
+```
+
+**Sending input reports** (device → browser):
+
+```cpp
+// Called by the RustDesk user-space service via the IOKit user client
+void RustDeskFIDODevice::submitInputReport(const uint8_t *data, uint32_t length) {
+    auto reportData = OSData::withBytes(data, length);
+    handleReport(reportData, kIOHIDReportTypeInput, kIOHIDOptionsTypeNone);
+    reportData->release();
+}
+```
+
+### Communication: DriverKit ↔ RustDesk Service
+
+The DriverKit extension runs in its own process (`DriverKit Runtime`). The
+RustDesk CTAP service communicates with it via an **IOKit User Client**:
+
+```mermaid
+flowchart LR
+    subgraph UserSpace["User Space"]
+        SVC["RustDesk CTAP Service\n(ctap_driverkit.rs)"]
+    end
+
+    subgraph DriverKit["DriverKit Runtime"]
+        DK["RustDeskFIDODevice\n(IOUserHIDDevice)"]
+        UC["IOUserClient subclass"]
+    end
+
+    subgraph Kernel["Kernel"]
+        IOKit["IOKit Registry"]
+    end
+
+    SVC <-->|"IOKit user client\n(IOConnectCallMethod)"| UC
+    UC <--> DK
+    DK <--> IOKit
+```
+
+The user client exposes external methods:
+
+| Method Index | Direction | Description |
+|-------------|-----------|-------------|
+| 0 | Read (driver → user) | Read next output report (blocks until available) |
+| 1 | Write (user → driver) | Submit input report to browser |
+| 2 | Read (driver → user) | Get device status |
+
+### Entitlements
+
+The DriverKit extension requires specific entitlements in its `.entitlements` file:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.developer.driverkit</key>
+    <true/>
+    <key>com.apple.developer.driverkit.family.hid.device</key>
+    <true/>
+    <key>com.apple.developer.driverkit.family.hid.virtual.device</key>
+    <true/>
+    <key>com.apple.developer.driverkit.transport.hid</key>
+    <true/>
+</dict>
+</plist>
+```
+
+**Important**: These entitlements must be requested from Apple via the Developer
+portal. Apple grants `com.apple.developer.driverkit` entitlements on a
+case-by-case basis. The request should explain that this is for creating virtual
+FIDO authenticators for remote desktop WebAuthn passthrough.
+
+The **host app** (RustDesk.app) also needs:
+
+```xml
+<key>com.apple.developer.system-extension.install</key>
+<true/>
+```
+
+### System Extension Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant App as RustDesk.app
+    participant SysExt as SystemExtensions Framework
+    participant DK as DriverKit Extension
+
+    App->>SysExt: OSSystemExtensionManager.submitRequest()
+    SysExt->>User: "RustDesk wants to install a system extension" dialog
+    User->>SysExt: Approve (may require System Settings)
+    SysExt->>DK: Load extension
+    DK->>DK: Start(), create virtual HID device
+    Note over DK: Device appears in IOKit registry
+    Note over DK: Browsers discover FIDO device
+```
+
+The extension is installed **once** (persists across reboots). The user approves
+it in System Settings → Privacy & Security → Extensions. Subsequent RustDesk
+launches reuse the installed extension.
+
+## Rust User-Space Integration
+
+```rust
+// src/server/ctap_driverkit.rs
+
+use core_foundation::base::*;
+use io_kit_sys::*;
+
+/// Handle to the virtual FIDO device via the DriverKit user client.
+pub struct DriverKitFidoDevice {
+    /// IOKit connection to the DriverKit user client
+    connection: io_connect_t,
+}
+
+impl DriverKitFidoDevice {
+    pub fn new() -> ResultType<Self> {
+        // 1. Find the IOKit service matching our driver class
+        let matching = IOServiceMatching(b"RustDeskFIDODevice\0".as_ptr() as *const _);
+        let service = IOServiceGetMatchingService(kIOMasterPortDefault, matching);
+        if service == 0 {
+            bail!("RustDeskFIDO DriverKit extension not found. Is it installed and approved?");
+        }
+
+        // 2. Open a user client connection
+        let mut connection: io_connect_t = 0;
+        let kr = IOServiceOpen(service, mach_task_self(), 0, &mut connection);
+        IOObjectRelease(service);
+        if kr != KERN_SUCCESS {
+            bail!("Failed to open DriverKit user client: {}", kr);
+        }
+
+        Ok(Self { connection })
+    }
+}
+
+#[async_trait::async_trait]
+impl VirtualFidoDevice for DriverKitFidoDevice {
+    async fn read_output_report(&self) -> ResultType<[u8; 64]> {
+        // Call external method 0 on the user client
+        // This blocks until the browser sends a report
+        let conn = self.connection;
+        tokio::task::spawn_blocking(move || {
+            let mut report = [0u8; 64];
+            let mut output_size = 64u64;
+            let kr = IOConnectCallMethod(
+                conn,
+                0,                      // Method index: read output report
+                std::ptr::null(), 0,    // No scalar input
+                std::ptr::null(), 0,    // No struct input
+                std::ptr::null_mut(), std::ptr::null_mut(), // No scalar output
+                report.as_mut_ptr() as _, &mut output_size, // Struct output
+            );
+            if kr != KERN_SUCCESS {
+                bail!("Failed to read output report: {}", kr);
+            }
+            Ok(report)
+        }).await?
+    }
+
+    fn write_input_report(&self, report: &[u8; 64]) -> ResultType<()> {
+        // Call external method 1 on the user client
+        let kr = unsafe {
+            IOConnectCallMethod(
+                self.connection,
+                1,                          // Method index: write input report
+                std::ptr::null(), 0,        // No scalar input
+                report.as_ptr() as _, 64,   // Struct input: 64-byte report
+                std::ptr::null_mut(), std::ptr::null_mut(),
+                std::ptr::null_mut(), std::ptr::null_mut(),
+            )
+        };
+        if kr != KERN_SUCCESS {
+            bail!("Failed to write input report: {}", kr);
+        }
+        Ok(())
+    }
+
+    fn destroy(&self) -> ResultType<()> {
+        // Close the user client connection
+        // The DriverKit extension keeps running but the virtual device
+        // becomes inactive (no reports accepted/delivered)
+        unsafe { IOServiceClose(self.connection) };
+        Ok(())
+    }
+}
+
+impl Drop for DriverKitFidoDevice {
+    fn drop(&mut self) {
+        let _ = self.destroy();
+    }
+}
+
+/// Check if the DriverKit extension is installed and available.
+pub fn is_driver_available() -> bool {
+    unsafe {
+        let matching = IOServiceMatching(b"RustDeskFIDODevice\0".as_ptr() as *const _);
+        let service = IOServiceGetMatchingService(kIOMasterPortDefault, matching);
+        if service != 0 {
+            IOObjectRelease(service);
+            true
+        } else {
+            false
+        }
+    }
+}
+```
+
+### Dependencies
+
+```toml
+# Added to Cargo.toml for macOS
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+io-kit-sys = "0.4"
+```
+
+These are already used by RustDesk for other macOS functionality.
+
+## Driver Deployment
+
+### Build Requirements
+
+- Xcode 14+ with DriverKit support
+- Apple Developer account with DriverKit entitlements approved
+- macOS 10.15+ deployment target
+
+### Code Signing
+
+| Requirement | Details |
+|-------------|---------|
+| Developer ID certificate | Required for distribution outside App Store |
+| DriverKit entitlement | Must be requested and approved by Apple |
+| Notarization | Required for macOS Gatekeeper approval |
+| Hardened Runtime | Required for notarization |
+
+### Installation
+
+The DriverKit extension is embedded in the RustDesk.app bundle. On first use:
+
+1. RustDesk calls `OSSystemExtensionManager.submitRequest()` to install the extension
+2. macOS prompts the user: "RustDesk wants to install a system extension"
+3. User navigates to System Settings → Privacy & Security → Extensions to approve
+4. Extension loads, virtual HID device becomes available
+
+Subsequent launches: the extension is already installed and loads automatically.
+
+### Alternative: IOHIDUserDevice (Development Only)
+
+For development and testing without the full DriverKit setup, macOS provides
+`IOHIDUserDevice` — a C API for creating virtual HID devices from user space:
+
+```rust
+// Development-only alternative (not for production)
+extern "C" {
+    fn IOHIDUserDeviceCreate(
+        allocator: CFAllocatorRef,
+        properties: CFDictionaryRef,
+    ) -> *mut c_void; // IOHIDUserDeviceRef
+
+    fn IOHIDUserDeviceHandleReport(
+        device: *mut c_void,
+        report: *const u8,
+        reportLength: CFIndex,
+    ) -> i32; // IOReturn
+}
+```
+
+This is simpler but may not work on all macOS versions with SIP enabled.
+Use DriverKit for production builds.
+
+## macOS Acceptance Criteria
+
+- [ ] DriverKit extension builds in Xcode with DriverKit entitlements
+- [ ] Extension creates a virtual HID device visible in IOKit Registry (`ioreg -l`)
+- [ ] The device's HID report descriptor matches `FIDO_HID_REPORT_DESCRIPTOR`
+- [ ] Chrome discovers the virtual FIDO device via IOKit HID Manager
+- [ ] Firefox discovers the virtual FIDO device via IOKit HID Manager
+- [ ] Safari discovers the virtual FIDO device via platform authenticator API
+- [ ] User client `read` method returns 64-byte output reports from the browser
+- [ ] User client `write` method delivers 64-byte input reports to the browser
+- [ ] Device becomes inactive when the user client connection is closed
+- [ ] `DriverKitFidoDevice` implements `VirtualFidoDevice` trait
+- [ ] `is_driver_available()` correctly detects extension presence
+- [ ] Extension installs via `OSSystemExtensionManager` with user approval
+- [ ] Extension is signed, notarized, and passes Gatekeeper
+- [ ] Extension survives reboot (persists after installation)

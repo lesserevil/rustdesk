@@ -54,7 +54,9 @@ These require a Linux system with `/dev/uhid` access (run as root or with
 appropriate udev rules). Mark with `#[ignore]` for CI — run manually or in
 a privileged CI job.
 
-### Virtual Device (Component 04)
+### Virtual Device — Linux (Component 04, Part A)
+
+Require `/dev/uhid` access (run as root or with udev rules). Mark with `#[ignore]`.
 
 | Test | Description |
 |------|-------------|
@@ -63,13 +65,35 @@ a privileged CI job.
 | `test_uhid_write_read` | Create device, open the hidraw node, write an output report, read it from uhid as `UHID_OUTPUT` |
 | `test_uhid_input_report` | Create device, write `UHID_INPUT2` from uhid, read it from the hidraw node |
 
-### CTAPHID Over Virtual Device (Components 04 + 05)
+### Virtual Device — Windows (Component 04, Part B)
+
+Require VHF driver installed. Mark with `#[ignore]`.
 
 | Test | Description |
 |------|-------------|
-| `test_ctaphid_init_over_uhid` | Create virtual device, open hidraw, send INIT request, handle in code, send response, read on hidraw, verify correct response |
-| `test_ctaphid_cbor_over_uhid` | Send a CBOR command through hidraw → uhid, reassemble, verify payload matches |
-| `test_ctaphid_multi_packet_over_uhid` | Send a large CBOR command that requires continuation packets |
+| `test_vhf_driver_available` | `is_driver_available()` returns true when driver is installed |
+| `test_vhf_create_destroy` | Create virtual FIDO device, verify it appears in Device Manager HID class, destroy it |
+| `test_vhf_ioctl_read_write` | Create device, write output report via HID class → VHF, read via IOCTL, write input report via IOCTL, verify on HID class side |
+| `test_vhf_report_descriptor` | Create device, query HID report descriptor via `HidD_GetPreparsedData`, verify FIDO usage page |
+
+### Virtual Device — macOS (Component 04, Part C)
+
+Require DriverKit extension installed and approved. Mark with `#[ignore]`.
+
+| Test | Description |
+|------|-------------|
+| `test_driverkit_available` | `is_driver_available()` returns true when extension is approved |
+| `test_driverkit_create_destroy` | Open user client, verify virtual FIDO device appears in `ioreg`, close connection |
+| `test_driverkit_read_write` | Open user client, send output report via IOKit HID → extension, read via user client method 0, write input report via user client method 1, verify on IOKit HID side |
+| `test_driverkit_report_descriptor` | Verify FIDO usage page via IOKit HID device properties |
+
+### CTAPHID Over Virtual Device (Components 04 + 05, all platforms)
+
+| Test | Description |
+|------|-------------|
+| `test_ctaphid_init_over_virtual_device` | Create virtual device (platform-appropriate), open HID handle, send INIT request, handle in code, send response, read on HID handle, verify correct response |
+| `test_ctaphid_cbor_over_virtual_device` | Send a CBOR command through HID → virtual device, reassemble, verify payload matches |
+| `test_ctaphid_multi_packet_over_virtual_device` | Send a large CBOR command that requires continuation packets |
 
 ### Remote Service (Component 06)
 
@@ -102,13 +126,13 @@ physical FIDO2 security key.
 
 ```mermaid
 flowchart LR
-    subgraph Local["Local Machine (client)"]
+    subgraph Local["Local Machine (Linux, Windows, or macOS)"]
         KEY[USB Security Key]
         CLIENT[RustDesk Client]
     end
 
-    subgraph Remote["Remote Machine (server)"]
-        BROWSER[Chrome/Firefox]
+    subgraph Remote["Remote Machine (Linux, Windows, or macOS)"]
+        BROWSER[Chrome/Firefox/Edge/Safari]
         SERVER[RustDesk Server]
     end
 
@@ -117,12 +141,36 @@ flowchart LR
 
 **Prerequisites**:
 - RustDesk built with CTAP feature enabled on both machines
-- udev rules installed on remote machine (for /dev/uhid)
-- udev rules installed on local machine (for hidraw access to FIDO key)
+- Remote setup:
+  - **Linux**: udev rules installed (for /dev/uhid access)
+  - **Windows**: VHF driver installed and signed
+  - **macOS**: DriverKit extension installed and approved in System Settings
+- Client setup:
+  - **Linux**: udev rules for hidraw access to FIDO key
+  - **Windows**: No special setup (USB HID accessible by default)
+  - **macOS**: No special setup (USB HID accessible by default)
 - Physical FIDO2 security key (YubiKey 5, SoloKey, or similar)
-- Chrome 90+ or Firefox 100+ on remote machine
+- Chrome 90+ / Firefox 100+ / Edge 100+ on remote machine
 - A WebAuthn test account (e.g., webauthn.io, passkeys.io, or GitHub with
   security key configured)
+
+### Platform Test Matrix
+
+E2E tests should be run across the following combinations:
+
+| Remote OS | Client OS | Client Type | Priority |
+|-----------|-----------|-------------|----------|
+| Linux | Linux | Native | P0 |
+| Linux | Windows | Native | P0 |
+| Linux | macOS | Native | P0 |
+| Windows | Windows | Native | P0 |
+| Windows | macOS | Native | P0 |
+| macOS | macOS | Native | P1 |
+| macOS | Windows | Native | P1 |
+| macOS | Linux | Native | P1 |
+| Linux | Any | Web + Companion | P1 |
+| Windows | Any | Web + Companion | P1 |
+| macOS | Any | Web + Companion | P2 |
 
 ### E2E-1: Basic Authentication Flow
 
@@ -218,6 +266,41 @@ flowchart LR
 
 **Expected**: < 2 seconds additional latency from the tunnel.
 
+### E2E-10: Web Client + Companion — Full Flow
+
+**Prerequisites**: RustDesk web client in browser, CTAP Companion App running locally,
+physical FIDO key connected.
+
+**Steps**:
+1. Open the RustDesk web client and connect to the remote machine
+2. Enable CTAP passthrough
+3. On remote browser, navigate to webauthn.io
+4. Register a new credential
+5. Verify: "Tap your security key" prompt appears in the web client
+6. Tap the key
+7. Verify: registration succeeds
+8. Log out, log back in, tap key again
+9. Verify: authentication succeeds
+
+### E2E-11: Web Client — Companion Not Running
+
+**Steps**:
+1. Ensure CTAP Companion App is NOT running
+2. Open RustDesk web client and connect to remote machine
+3. Enable CTAP passthrough, trigger WebAuthn on remote
+4. Verify: web client shows "Companion app required" guidance with download link
+5. Verify: remote browser receives an authentication error (not a hang)
+
+### E2E-12: Web Client — Companion Disconnect Mid-Transaction
+
+**Steps**:
+1. Web client + companion running, trigger WebAuthn authentication
+2. While "Tap your key" prompt is visible, kill the companion process
+3. Verify: web client detects disconnection, dismisses prompt
+4. Verify: remote browser receives an error (not a hang)
+5. Restart companion, trigger another authentication
+6. Verify: web client reconnects and authentication works
+
 ## Performance Tests
 
 | Metric | Target | How to measure |
@@ -227,17 +310,21 @@ flowchart LR
 | Virtual device creation time | < 100ms | Timestamp around uhid create |
 | Memory overhead of CTAP service | < 1MB | Process memory before/after enabling |
 
-## Browser Compatibility Matrix
+## Browser Compatibility Matrix (Remote Side)
 
-| Browser | Version | Platform | Expected Result |
-|---------|---------|----------|-----------------|
-| Chrome | 90+ | Linux x86_64 | Full support |
-| Chrome | 120+ | Linux ARM64 | Full support |
-| Firefox | 100+ | Linux x86_64 | Full support |
-| Firefox | 100+ (Snap) | Ubuntu | May fail (AppArmor blocks hidraw) |
-| Chromium | 90+ | Linux x86_64 | Full support |
-| Edge | Any | Linux | Full support (Chromium-based) |
-| Brave | Any | Linux | Full support (Chromium-based) |
+| Browser | Version | Remote OS | FIDO Discovery | Expected Result |
+|---------|---------|-----------|---------------|-----------------|
+| Chrome | 90+ | Linux | hidraw scan | Full support |
+| Chrome | 100+ | Windows | webauthn.dll → HID class | Full support |
+| Firefox | 100+ | Linux | hidraw scan | Full support |
+| Firefox | 100+ | Windows | Own HID stack (default) or webauthn.dll | Full support |
+| Firefox | 100+ (Snap) | Ubuntu | AppArmor blocks hidraw | May fail |
+| Edge | 100+ | Windows | webauthn.dll → HID class | Full support |
+| Chromium | 90+ | Linux | hidraw scan | Full support |
+| Brave | Any | Linux/Windows | Same as Chromium | Full support |
+| Chrome | 100+ | macOS | IOKit HID Manager | Full support |
+| Firefox | 100+ | macOS | IOKit HID Manager | Full support |
+| Safari | 14+ | macOS | Platform authenticator API → IOKit | Full support |
 
 ## Security Key Compatibility
 

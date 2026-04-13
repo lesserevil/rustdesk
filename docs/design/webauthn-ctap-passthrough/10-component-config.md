@@ -50,43 +50,35 @@ from `Ctap = 8` in the Permission enum.)
 ### R3: Runtime availability check
 
 Before advertising CTAP support in PeerInfo, check that the feature is actually
-usable on this system:
+usable on this system. The check is platform-specific:
 
 ```rust
 /// Check if CTAP passthrough is available on this system.
 ///
 /// Requirements:
-/// - Linux only
-/// - /dev/uhid exists and is accessible
+/// - Linux: /dev/uhid exists and is accessible
+/// - Windows: VHF driver is installed and running
+/// - macOS: Not supported as remote (server) side
 /// - Feature is enabled in config
 pub fn is_ctap_available() -> bool {
-    #[cfg(not(target_os = "linux"))]
-    return false;
+    // Check feature is enabled (all platforms)
+    if !Self::is_permission_enabled_locally(keys::OPTION_ENABLE_CTAP) {
+        return false;
+    }
 
     #[cfg(target_os = "linux")]
     {
         use std::path::Path;
 
-        // Check feature is enabled
-        if !Self::is_permission_enabled_locally(keys::OPTION_ENABLE_CTAP) {
-            return false;
-        }
-
-        // Check /dev/uhid exists
         if !Path::new("/dev/uhid").exists() {
             log::debug!("CTAP: /dev/uhid not found");
             return false;
         }
 
-        // Check /dev/uhid is writable (don't actually open it,
-        // just check metadata)
         match std::fs::metadata("/dev/uhid") {
             Ok(meta) => {
                 use std::os::unix::fs::MetadataExt;
-                // Check we can write (this is a rough check;
-                // actual permission depends on our uid/gid)
                 let mode = meta.mode();
-                // At minimum, check the file exists and is a char device
                 if mode & libc::S_IFCHR == 0 {
                     log::debug!("CTAP: /dev/uhid is not a character device");
                     return false;
@@ -98,6 +90,23 @@ pub fn is_ctap_available() -> bool {
                 false
             }
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Check that the RustDesk VHF virtual FIDO driver is installed.
+        crate::server::ctap_vhf::is_driver_available()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // Check that the RustDesk DriverKit extension is installed and approved.
+        crate::server::ctap_driverkit::is_driver_available()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        false
     }
 }
 ```
@@ -111,9 +120,9 @@ where PeerInfo is built:
 pi.ctap_passthrough_supported = Self::is_ctap_available();
 ```
 
-### R5: Udev rules
+### R5: System setup (platform-specific)
 
-Create a udev rule file for distribution:
+#### Linux: Udev rules
 
 **File**: `res/udev/99-rustdesk-ctap.rules`
 
@@ -129,7 +138,7 @@ KERNEL=="uhid", MODE="0660", GROUP="rustdesk"
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="f1d0", MODE="0664", GROUP="plugdev"
 ```
 
-**Installation instructions** (for documentation):
+**Installation instructions**:
 
 ```bash
 # Install udev rule
@@ -148,36 +157,81 @@ sudo modprobe uhid
 echo uhid | sudo tee /etc/modules-load.d/uhid.conf
 ```
 
+#### Windows: VHF driver installation
+
+The RustDesk VHF driver (`rustdesk_vhf.inf` + `rustdesk_vhf.dll`) must be
+installed on the remote Windows machine. This can be done:
+
+**Bundled with installer** (recommended):
+The RustDesk MSI/NSIS installer includes the signed VHF driver and installs it
+via `pnputil` during setup. The installer handles:
+- Driver installation: `pnputil /add-driver rustdesk_vhf.inf /install`
+- Driver removal on uninstall: `pnputil /delete-driver rustdesk_vhf.inf /uninstall`
+
+**Manual installation**:
+```powershell
+# Requires Administrator PowerShell
+pnputil /add-driver rustdesk_vhf.inf /install
+
+# Verify installation
+pnputil /enum-drivers | findstr "rustdesk"
+
+# Remove
+pnputil /delete-driver rustdesk_vhf.inf /uninstall /force
+```
+
+**Requirements**:
+- Windows 10 version 1903 or later (VHF support)
+- The driver must be attestation-signed for production (see Component 04, Part B)
+- No reboot required — the driver loads on demand when the CTAP service starts
+
+#### macOS: DriverKit system extension
+
+The RustDesk DriverKit extension (`com.rustdesk.RustDeskFIDODriver.dext`) is
+embedded in the RustDesk.app bundle. Setup happens on first use:
+
+1. RustDesk detects that CTAP is enabled but the extension is not yet approved
+2. RustDesk calls `OSSystemExtensionManager.submitRequest()` to install
+3. macOS shows: "RustDesk wants to install a system extension"
+4. User approves in System Settings → Privacy & Security → Extensions
+5. Extension loads, virtual FIDO device becomes available
+
+The extension persists across reboots — the approval step is one-time only.
+
+**Requirements**:
+- macOS 10.15 (Catalina) or later
+- User must approve the system extension in System Settings
+- RustDesk.app must be signed with Developer ID and notarized
+- DriverKit entitlements must be approved by Apple
+
 ### R6: Client-side availability check
 
 The client also needs a runtime check — is there a physical FIDO key connected?
+This works on all platforms (Linux, Windows, macOS) via `hidapi`.
 
 ```rust
 /// Check if a physical FIDO authenticator is available on this machine.
 ///
 /// This is a quick enumeration — it does NOT open any device.
+/// Works on Linux (hidraw), Windows (Windows HID API), and macOS (IOHidManager).
 pub fn is_local_fido_available() -> bool {
-    #[cfg(not(target_os = "linux"))]
-    return false;
-
-    #[cfg(target_os = "linux")]
-    {
-        match hidapi::HidApi::new() {
-            Ok(api) => {
-                api.device_list()
-                    .any(|d| d.usage_page() == 0xF1D0 && d.usage() == 0x01)
-            }
-            Err(e) => {
-                log::debug!("hidapi initialization failed: {}", e);
-                false
-            }
+    match hidapi::HidApi::new() {
+        Ok(api) => {
+            api.device_list()
+                .any(|d| d.usage_page() == 0xF1D0 && d.usage() == 0x01)
+        }
+        Err(e) => {
+            log::debug!("hidapi initialization failed: {}", e);
+            false
         }
     }
 }
 ```
 
-This is called by the client when deciding whether to send
-`CtapControl{enabled: true}` after login.
+This is called by the native client when deciding whether to send
+`CtapControl{enabled: true}` after login. The web client performs an equivalent
+check by connecting to the companion app and reading the `fido_available` field
+from the `hello_ack` response.
 
 ## Configuration Flow
 
@@ -185,16 +239,23 @@ This is called by the client when deciding whether to send
 flowchart TD
     A[Server starts] --> B{OPTION_ENABLE_CTAP == Y?}
     B -->|No| C[ctap_passthrough_supported = false in PeerInfo]
-    B -->|Yes| D{/dev/uhid accessible?}
-    D -->|No| C
-    D -->|Yes| E[ctap_passthrough_supported = true in PeerInfo]
+    B -->|Yes| D{Platform check}
+    D -->|"Linux: /dev/uhid accessible?"| E{Yes/No}
+    D -->|"Windows: VHF driver installed?"| E
+    D -->|"macOS: DriverKit extension approved?"| E
+    E -->|No| C
+    E -->|Yes| F[ctap_passthrough_supported = true in PeerInfo]
 
-    E --> F[Client receives PeerInfo]
-    F --> G{Client has FIDO key + feature enabled?}
-    G -->|No| H[Do not send CtapControl]
-    G -->|Yes| I[Send CtapControl enabled=true]
+    F --> G[Client receives PeerInfo]
+    G --> H{Client type?}
+    H -->|Native| I{hidapi finds FIDO key?}
+    H -->|Web| J{Companion app connected + FIDO key?}
+    I -->|No| K[Do not send CtapControl]
+    J -->|No| K
+    I -->|Yes| L[Send CtapControl enabled=true]
+    J -->|Yes| L
 
-    I --> J[Server spawns CTAP service]
+    L --> M[Server spawns CTAP service]
 ```
 
 ## Settings UI

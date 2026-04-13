@@ -13,18 +13,18 @@ flowchart TD
         USER[User at Local Machine]
     end
 
-    subgraph TB2["Trust Boundary 2: Local Machine"]
-        CLIENT[RustDesk Client]
-        HIDAPI[hidapi / hidraw]
+    subgraph TB2["Trust Boundary 2: Local Machine (Linux/Windows/macOS)"]
+        CLIENT["RustDesk Client\n(native or web + companion)"]
+        HIDAPI["hidapi\n(Linux: hidraw, Windows: HID API, macOS: IOKit)"]
     end
 
     subgraph TB3["Trust Boundary 3: Network"]
         TUNNEL[RustDesk Encrypted Channel]
     end
 
-    subgraph TB4["Trust Boundary 4: Remote Machine"]
+    subgraph TB4["Trust Boundary 4: Remote Machine (Linux/Windows/macOS)"]
         SERVER[RustDesk Server]
-        UHID[Virtual FIDO Device]
+        VDEV["Virtual FIDO Device\n(Linux: uhid, Win: VHF, macOS: DriverKit)"]
         BROWSER[Browser]
         RP[Relying Party Website]
     end
@@ -34,8 +34,8 @@ flowchart TD
     HIDAPI <--> CLIENT
     CLIENT <--> TUNNEL
     TUNNEL <--> SERVER
-    SERVER <--> UHID
-    UHID <--> BROWSER
+    SERVER <--> VDEV
+    VDEV <--> BROWSER
     BROWSER <--> RP
 ```
 
@@ -218,6 +218,92 @@ encrypted by RustDesk's transport.
 | **Windows Remote Desktop** | WebAuthn redirection via RDP channel | Similar concept but limited to Azure AD / Windows Hello. |
 | **RustDesk CTAP Passthrough** | uhid on remote, hidapi on local | Equivalent security properties to CTAP Hybrid. |
 
+#### T8: Windows VHF Driver as Attack Surface
+
+**Threat**: The VHF driver runs in a user-mode driver host process and creates
+a virtual HID device accessible to all processes. A malicious local process could
+open the driver's device interface and inject CTAP commands or read responses.
+
+**Mitigation**:
+1. The driver's device interface uses a security descriptor that restricts access
+   to the RustDesk process (matched by process path or a custom security group).
+2. The driver only accepts one concurrent client — the first process to open the
+   device interface owns it exclusively for that session.
+3. The device interface GUID is not publicly documented, reducing discoverability
+   (security by obscurity as an additional layer, not the primary control).
+4. Same CTAP2 command allowlist applies (defense-in-depth).
+
+**Residual risk**: A local admin or a process running as the same user could
+potentially access the driver. This is equivalent to the Linux uhid risk (any
+process with write access to `/dev/uhid` can inject events). Mitigated by the
+single-client lock.
+
+**Severity**: Low (local privilege required, single-client lock prevents hijacking).
+
+#### T8a: macOS DriverKit Extension as Attack Surface
+
+**Threat**: The DriverKit extension creates a virtual HID device accessible via
+IOKit. A local process could open the IOKit user client and inject CTAP commands
+or read browser responses.
+
+**Mitigation**:
+1. The IOKit user client uses `clientHasPrivilege` checks — only processes signed
+   by the same team ID (RustDesk) can open the user client connection.
+2. Single concurrent client: the user client rejects a second connection while
+   one is active.
+3. macOS system extension approval requires explicit user consent — the extension
+   cannot be installed silently.
+4. The extension runs in a hardened sandbox with minimal privileges (only HID
+   device creation via DriverKit).
+
+**Residual risk**: Equivalent to the Linux uhid / Windows VHF risks — a local
+process running as the same user with the right code signature could access the
+device. Mitigated by single-client lock.
+
+**Severity**: Low (system extension approval + code signing + single-client lock).
+
+#### T9: Malicious Web Page Connects to Companion App (Web Client)
+
+**Threat**: A malicious web page running in the user's browser discovers the
+companion's localhost WebSocket port and sends crafted CTAP relay requests to
+sign assertions for an attacker-controlled relying party.
+
+**Mitigation**:
+1. **Origin checking**: The companion validates the `Origin` header on the
+   WebSocket upgrade request. Only allowed origins (the RustDesk web client
+   domain, localhost) are accepted.
+2. **CTAP2 command allowlist**: Even if an attacker bypasses origin checks,
+   the companion only forwards allowed CTAP2 commands (0x01, 0x02, 0x04, 0x06,
+   0x08, 0x0B). Destructive operations are blocked.
+3. **User presence required**: The physical key still requires a touch. The user
+   would see an unexpected "Tap your key" prompt, which is a visible signal.
+4. **Single session**: The companion accepts only one WebSocket connection at a
+   time. If the RustDesk web client is already connected, the attacker's
+   connection is rejected.
+
+**Residual risk**: If the user has no active RustDesk session but the companion
+is running, and the attacker can spoof the allowed origin, they could prompt the
+user to touch their key. The rpId binding in CTAP2 limits what can be signed,
+but the user might touch the key reflexively. Rate limiting (no more than one
+request per 2 seconds) further reduces this risk.
+
+**Severity**: Medium if origin check is bypassed, Low with all mitigations.
+
+#### T10: Companion App as Persistent Local Attack Surface (Web Client)
+
+**Threat**: The companion app listens on a localhost port, creating a persistent
+attack surface on the user's machine.
+
+**Mitigation**:
+1. The companion binds to `127.0.0.1` only (not `0.0.0.0`) — not network-accessible
+2. The companion should only run when needed, not as a permanent daemon. Ideal:
+   launched on demand by the web client and exits after idle timeout (e.g., 5
+   minutes with no WebSocket connection).
+3. The companion does not store any state, credentials, or configuration beyond
+   the allowed-origin list.
+
+**Severity**: Low.
+
 ## Recommendations
 
 ### Must-have (before merging)
@@ -237,8 +323,31 @@ encrypted by RustDesk's transport.
 10. Display rpId in the "Tap your key" prompt (requires CBOR parsing)
 11. Option to require user confirmation before each CTAP relay (beyond the key touch)
 
+### Must-have for Windows VHF Driver (Component 04, Part B)
+
+8f. Driver device interface restricted by security descriptor
+8g. Single concurrent client lock on driver device interface
+8h. Driver must be attestation-signed (not test-signed) for production
+8i. Driver must cleanly destroy virtual device when client disconnects or process crashes
+
+### Must-have for macOS DriverKit Extension (Component 04, Part C)
+
+8j. IOKit user client restricted to RustDesk team ID via `clientHasPrivilege`
+8k. Single concurrent user client connection
+8l. Extension must be notarized and signed with Developer ID
+8m. Extension must request only `com.apple.developer.driverkit.family.hid.virtual.device` entitlement (minimal privileges)
+
+### Must-have for Companion App (Component 13)
+
+8a. Origin validation on WebSocket upgrade — reject unknown origins
+8b. Localhost-only binding (127.0.0.1, not 0.0.0.0)
+8c. Single active WebSocket session limit
+8d. CTAP2 command allowlist enforced in companion (defense-in-depth, mirrors remote filter)
+8e. Idle timeout — companion exits after 5 minutes with no connection
+
 ### Nice-to-have (future)
 
 12. PIN entry UI on the local machine (currently relies on key's built-in PIN)
 13. Allowlist of rpIds that can use CTAP passthrough
 14. Metrics/telemetry for CTAP usage (number of transactions, success rate)
+15. On-demand companion launch — web client triggers companion start via registered protocol handler

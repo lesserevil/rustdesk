@@ -2,23 +2,66 @@
 
 ## System Context
 
+There are two client paths — native and web — that share the same remote-side
+architecture but differ in how they reach the physical security key.
+
+### Native Client Path
+
 ```mermaid
 flowchart TD
-    subgraph Remote["REMOTE MACHINE"]
-        Browser["Browser (Chrome/FF)"] -->|CTAPHID| HID["Kernel HID Subsystem\n/dev/hidraw"]
-        HID -->|"read reports"| UHID["/dev/uhid\nVirtual FIDO Device"]
-        UHID -->|"UHID_OUTPUT events"| SVC["CTAP Service\n(ctap_service.rs)"]
-        SVC -->|"UHID_INPUT2 events"| UHID
+    subgraph Remote["REMOTE MACHINE (Linux, Windows, or macOS)"]
+        Browser["Browser (Chrome/FF/Edge)"] -->|CTAPHID| HID["OS HID Subsystem"]
+        HID -->|"output reports"| VDEV["Virtual FIDO Device\n(Linux: uhid, Win: VHF,\nmacOS: DriverKit)"]
+        VDEV -->|"output events"| SVC["CTAP Service\n(ctap_service.rs)"]
+        SVC -->|"input reports"| VDEV
         SVC --> CONN["RustDesk Server\nconnection.rs"]
     end
 
     CONN <-->|"CtapFrame protobuf\n(encrypted channel)"| IO
 
-    subgraph Local["LOCAL MACHINE"]
-        IO["RustDesk Client\nio_loop.rs"] <-->|hidapi| KEY["Physical Security Key\n/dev/hidrawN"]
+    subgraph Local["LOCAL MACHINE (Linux, Windows, or macOS)"]
+        IO["RustDesk Client\nio_loop.rs"] <-->|hidapi| KEY["Physical Security Key"]
         IO -->|push_event| UI["Flutter UI\n'Tap your key' prompt"]
     end
 ```
+
+### Web Client Path
+
+```mermaid
+flowchart TD
+    subgraph Remote["REMOTE MACHINE (Linux, Windows, or macOS)"]
+        Browser["Browser (Chrome/FF/Edge)"] -->|CTAPHID| HID["OS HID Subsystem"]
+        HID -->|"output reports"| VDEV["Virtual FIDO Device\n(Linux: uhid, Win: VHF,\nmacOS: DriverKit)"]
+        VDEV -->|"output events"| SVC["CTAP Service\n(ctap_service.rs)"]
+        SVC -->|"input reports"| VDEV
+        SVC --> CONN["RustDesk Server\nconnection.rs"]
+    end
+
+    CONN <-->|"CtapFrame protobuf\n(encrypted channel)"| WEBCLIENT
+
+    subgraph LocalBrowser["LOCAL MACHINE — Browser (any OS)"]
+        WEBCLIENT["RustDesk Web Client\n(Flutter/Dart)"]
+        WEBCLIENT -->|push_event| WEBUI["Flutter Web UI\n'Tap your key' prompt"]
+    end
+
+    WEBCLIENT <-->|"WebSocket JSON\nlocalhost:21118"| COMPANION
+
+    subgraph LocalCompanion["LOCAL MACHINE — Companion App (any OS)"]
+        COMPANION["CTAP Companion\n(ctap-companion)"] <-->|hidapi| KEY["Physical Security Key"]
+    end
+```
+
+**Why a companion app?** Browsers block raw access to FIDO security keys — WebUSB
+blocklists them, WebHID blocklists them, and the WebAuthn API enforces rpId origin
+matching (the web client's origin doesn't match the remote website). A small native
+companion (~1-2 MB) bridges this gap. See [13-component-companion-app.md](13-component-companion-app.md)
+for full details.
+
+### What's Shared
+
+The remote side (everything above the `CtapFrame` boundary) is identical for both
+client types. The `CtapFrame` protobuf message is the abstraction boundary — the
+remote service doesn't know or care whether the client is native or web.
 
 ## Component Summary
 
@@ -29,11 +72,14 @@ There are 7 new components, plus modifications to 5 existing files:
 | Component | New File(s) | Purpose |
 |-----------|-------------|---------|
 | Protobuf Messages | `libs/hbb_common/protos/message.proto` (modified) | `CtapFrame` message type |
-| Virtual FIDO Device | `src/server/ctap_uhid.rs` | Creates/manages virtual FIDO device via `/dev/uhid` |
-| CTAPHID Framing | `src/ctap_hid.rs` | Assembles/disassembles CTAPHID packets from 64-byte HID reports |
+| Virtual FIDO Device | `src/server/ctap_virtual_device.rs` (trait), `ctap_uhid.rs` (Linux), `ctap_vhf.rs` (Windows), `ctap_driverkit.rs` (macOS) | Creates/manages virtual FIDO device per platform |
+| CTAPHID Framing | `libs/ctap-common/src/ctap_hid.rs` | Assembles/disassembles CTAPHID packets from 64-byte HID reports |
+| FIDO Relay Logic | `libs/ctap-common/src/fido_relay.rs` | Core CTAP2 relay to physical key via `hidapi` (shared library) |
 | Remote CTAP Service | `src/server/ctap_service.rs` | Orchestrates uhid + framing + message forwarding on remote side |
-| Local Authenticator Driver | `src/client/ctap_local.rs` | Talks to physical security key via `hidapi` on local side |
-| Flutter UI | `flutter/lib/widgets/ctap_prompt.dart` | "Tap your key" dialog |
+| Local Authenticator Driver (native) | `src/client/ctap_local.rs` | Native client: calls `ctap-common` relay directly in-process |
+| Local Authenticator Driver (web) | `flutter/lib/common/widgets/ctap_websocket.dart` | Web client: relays via WebSocket to companion app |
+| CTAP Companion App | `ctap-companion/` (standalone crate) | Headless native binary providing WebSocket bridge to FIDO key |
+| Flutter UI | `flutter/lib/common/widgets/ctap_prompt.dart` | "Tap your key" dialog (shared by native and web) |
 | Configuration | Multiple config locations | Feature flag, permission, udev rules |
 
 ### Modified Existing Files
@@ -41,9 +87,10 @@ There are 7 new components, plus modifications to 5 existing files:
 | File | Change |
 |------|--------|
 | `src/server/connection.rs` | Add `CtapFrame` handling in `on_message()`, spawn CTAP service on auth |
-| `src/client/io_loop.rs` | Add `CtapFrame` handling in `handle_msg_from_peer()`, spawn local driver |
+| `src/client/io_loop.rs` | Add `CtapFrame` handling in `handle_msg_from_peer()`, dispatch to native or web driver |
 | `src/ipc.rs` | Add `CtapRequest`/`CtapResponse` IPC variants (if IPC-separated architecture chosen) |
 | `src/flutter.rs` | Add `authenticator_prompt` event push |
+| `flutter/lib/models/model.dart` | Add `authenticator_prompt` event handler, dispatch to `CtapModel` |
 | `libs/hbb_common/protos/message.proto` | Add `CtapFrame` message, add to `Message` oneof |
 
 ## Data Flow - Detailed Sequence
@@ -160,3 +207,37 @@ by default, controllable per-connection.
 
 **Rationale**: Consistent with RustDesk's permission model. Users must explicitly
 opt in. Server operators can disable it via configuration.
+
+### D6: Dual client paths — native driver and web companion
+
+**Decision**: The native client uses `hidapi` directly (in-process). The web client
+uses a localhost WebSocket companion app that wraps the same `hidapi` logic. Both
+paths share CTAPHID framing and FIDO relay code via `libs/ctap-common/`.
+
+**Rationale**: Browsers block raw FIDO HID access (WebUSB, WebHID blocklists) and
+the WebAuthn API enforces rpId origin matching, making a pure browser-side
+implementation impossible. A companion app is the smallest bridge that works.
+Extracting shared code into `ctap-common` prevents divergence between the two paths.
+
+### D8: Platform-specific virtual device implementations behind a common trait
+
+**Decision**: Each remote platform uses its native mechanism for creating virtual
+HID devices (Linux: uhid, Windows: VHF/UMDF2, macOS: DriverKit/IOUserHIDDevice),
+all implementing the `VirtualFidoDevice` trait. The CTAP service uses only the trait.
+
+**Rationale**: Each OS has a fundamentally different kernel/driver model for virtual
+HID devices. There is no cross-platform abstraction at this level. The trait keeps
+the CTAP service (Component 06) platform-agnostic while allowing each implementation
+to use native APIs optimally. This mirrors how RustDesk handles virtual input
+devices (uinput on Linux, SendInput on Windows, CGEvent on macOS).
+
+### D7: CtapFrame is the abstraction boundary
+
+**Decision**: The remote side (uhid, CTAP service, connection routing) is identical
+regardless of client type. The `CtapFrame` protobuf message is the only interface
+between remote and local. The remote side does not know whether the client is
+native or web.
+
+**Rationale**: This keeps the remote side simple and testable. Any future client
+type (mobile, embedded) only needs to implement the local driver side of the
+`CtapFrame` protocol.

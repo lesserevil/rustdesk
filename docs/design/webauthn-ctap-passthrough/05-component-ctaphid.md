@@ -531,11 +531,26 @@ fn test_payload_too_large() {
 
 ## File Placement
 
-Place in `src/ctap_hid.rs` (top-level `src/`, not under `server/` or `client/`)
-because it is used by both sides. Add `pub mod ctap_hid;` to `src/lib.rs` or
-`src/main.rs` (check which is the crate root).
+Place in `libs/ctap-common/src/ctap_hid.rs` as part of the shared `ctap-common`
+library crate. This crate is used by:
 
-Gate with `#[cfg(target_os = "linux")]` at the module level.
+- The main RustDesk binary (remote service + native local driver)
+- The standalone CTAP Companion App (Component 13, for the web client)
+
+```toml
+# libs/ctap-common/Cargo.toml
+[package]
+name = "ctap-common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = "1"
+```
+
+The crate has no OS-specific dependencies — CTAPHID framing is pure protocol logic.
+OS-specific gating (`#[cfg(target_os = "linux")]`) is applied by the consumers,
+not by `ctap-common` itself.
 
 ## Acceptance Criteria
 
