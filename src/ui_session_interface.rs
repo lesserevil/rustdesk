@@ -783,6 +783,29 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::Message(msg_out));
     }
 
+    pub fn send_ctap_response(&self, response_json: String) {
+        use hbb_common::base64::Engine;
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&response_json) {
+            let command = parsed["command"].as_u64().unwrap_or(0) as u32;
+            let payload_b64 = parsed["payload"].as_str().unwrap_or("");
+            let payload = hbb_common::base64::engine::general_purpose::STANDARD
+                .decode(payload_b64)
+                .unwrap_or_default();
+            let error_code = parsed["error_code"].as_u64().unwrap_or(0) as u32;
+
+            let frame = hbb_common::message_proto::CtapFrame {
+                command,
+                payload: payload.into(),
+                is_response: true,
+                error_code,
+                ..Default::default()
+            };
+            let mut msg_out = Message::new();
+            msg_out.set_ctap_frame(frame);
+            self.send(Data::Message(msg_out));
+        }
+    }
+
     // Terminal methods
     pub fn open_terminal(&self, terminal_id: i32, rows: u32, cols: u32) {
         let mut action = TerminalAction::new();
@@ -1724,6 +1747,7 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     fn printer_request(&self, id: i32, path: String);
     fn handle_screenshot_resp(&self, sid: String, msg: String);
     fn handle_terminal_response(&self, response: TerminalResponse);
+    fn on_ctap_request(&self, _command: u32, _payload_b64: &str) {}
 }
 
 impl<T: InvokeUiSession> Deref for Session<T> {

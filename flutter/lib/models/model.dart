@@ -15,6 +15,7 @@ import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/models/ab_model.dart';
 import 'package:flutter_hbb/models/chat_model.dart';
 import 'package:flutter_hbb/models/cm_file_model.dart';
+import 'package:flutter_hbb/models/ctap_model.dart';
 import 'package:flutter_hbb/models/file_model.dart';
 import 'package:flutter_hbb/models/group_model.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
@@ -476,6 +477,17 @@ class FfiModel with ChangeNotifier {
       } else if (name == 'exit_relative_mouse_mode') {
         // Handle exit shortcut from rdev grab loop (Ctrl+Alt on Win/Linux, Cmd+G on macOS)
         parent.target?.inputModel.exitRelativeMouseModeWithKeyRelease();
+      } else if (name == 'authenticator_prompt') {
+        final active = evt['active'] == 'true';
+        final message = evt['message'] ?? 'Tap your security key';
+        if (active) {
+          parent.target?.ctapModel.showPrompt(message);
+        } else {
+          parent.target?.ctapModel.hidePrompt();
+        }
+      } else if (name == 'ctap_request') {
+        // Web client path: Rust/WASM pushes CTAP request to Dart for relay
+        parent.target?.ctapModel.handleCtapRequest(evt);
       } else {
         debugPrint('Event is not handled in the fixed branch: $name');
       }
@@ -3623,6 +3635,7 @@ class FFI {
   late final ElevationModel elevationModel; // session
   late final CmFileModel cmFileModel; // cm
   late final TextureModel textureModel; //session
+  late final CtapModel ctapModel; // session
   late final Peers recentPeersModel; // global
   late final Peers favoritePeersModel; // global
   late final Peers lanPeersModel; // global
@@ -3652,6 +3665,7 @@ class FFI {
     elevationModel = ElevationModel(WeakReference(this));
     cmFileModel = CmFileModel(WeakReference(this));
     textureModel = TextureModel(WeakReference(this));
+    ctapModel = CtapModel(WeakReference(this));
     recentPeersModel = Peers(
         name: PeersModelName.recent,
         loadEvent: LoadEvent.recent,

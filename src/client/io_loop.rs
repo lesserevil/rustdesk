@@ -2072,23 +2072,29 @@ impl<T: InvokeUiSession> Remote<T> {
     async fn handle_ctap_request(&mut self, frame: CtapFrame, _peer: &mut Stream) {
         log::info!("CTAP request received from remote, relaying to local key");
 
-        // Create cancellation channel
-        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
-        self.ctap_cancel_tx = Some(cancel_tx);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Native path: relay directly to physical key via hidapi
+            let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+            self.ctap_cancel_tx = Some(cancel_tx);
 
-        // Spawn async relay task
-        let sender = self.sender.clone();
-        let payload = frame.payload.to_vec();
+            let sender = self.sender.clone();
+            let payload = frame.payload.to_vec();
 
-        tokio::spawn(async move {
-            let response =
-                crate::client::ctap_local::relay_to_physical_key(payload, cancel_rx).await;
+            tokio::spawn(async move {
+                let response =
+                    crate::client::ctap_local::relay_to_physical_key(payload, cancel_rx).await;
 
-            // Send response back to remote
-            let mut msg = Message::new();
-            msg.set_ctap_frame(response);
-            let _ = sender.send(Data::Message(msg));
-        });
+                let mut msg = Message::new();
+                msg.set_ctap_frame(response);
+                let _ = sender.send(Data::Message(msg));
+            });
+        }
+
+        // Web client path: The web client doesn't use io_loop.rs.
+        // Instead, CtapFrame messages are dispatched as 'ctap_request' events
+        // by the web client's JavaScript bridge, and handled by CtapModel in Dart
+        // which relays to the companion app via WebSocket.
     }
 
     fn set_peer_info(&mut self, pi: &PeerInfo) {

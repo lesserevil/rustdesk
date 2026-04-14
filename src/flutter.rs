@@ -1123,6 +1123,17 @@ impl InvokeUiSession for FlutterHandler {
         }
     }
 
+    fn on_ctap_request(&self, command: u32, payload_b64: &str) {
+        self.push_event(
+            "ctap_request",
+            &[
+                ("command", &command.to_string()),
+                ("payload", &payload_b64.to_string()),
+            ],
+            &[],
+        );
+    }
+
     fn handle_terminal_response(&self, response: TerminalResponse) {
         use hbb_common::message_proto::terminal_response::Union;
 

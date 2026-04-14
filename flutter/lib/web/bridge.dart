@@ -487,6 +487,14 @@ class RustdeskImpl {
         () => js.context.callMethod('setByName', ['send_chat', text]));
   }
 
+  Future<void> sessionSendCtapResponse(
+      {required UuidValue sessionId,
+      required String response,
+      dynamic hint}) {
+    return Future(() => js.context
+        .callMethod('setByName', ['send_ctap_response', response]));
+  }
+
   Future<void> sessionPeerOption(
       {required UuidValue sessionId,
       required String name,
