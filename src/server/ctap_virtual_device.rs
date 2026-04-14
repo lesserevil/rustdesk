@@ -40,7 +40,7 @@ pub const VIRTUAL_FIDO_PID: u16 = 0xF1D0;
 ///
 /// The CTAP service uses this trait to interact with the virtual device
 /// without knowing the platform-specific implementation.
-pub trait VirtualFidoDevice: Send {
+pub trait VirtualFidoDevice: Send + Sync {
     /// Read an output report (browser → virtual device).
     /// Blocks until a report is available. Returns exactly 64 bytes.
     fn read_output_report(&self) -> ResultType<[u8; 64]>;
