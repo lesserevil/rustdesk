@@ -46,47 +46,37 @@ impl UhidFidoDevice {
         // Event type: UHID_CREATE2 (u32 LE at offset 0)
         buf[0..4].copy_from_slice(&(UHID_CREATE2 as u32).to_le_bytes());
 
-        // UHID_CREATE2 payload starts at offset 4:
-        //   name: [u8; 128] at offset 4
-        //   rd_size: u16 at offset 4+128+128+128+2+2+4+4 = offset 400
-        //   rd_data: [u8; 4096] at offset 402
-        //   bus: u16 at offset 132
-        //   vendor: u32 at offset 136
-        //   product: u32 at offset 140
-        //   Actually, the struct layout for uhid_create2_req is:
-        //   u8 name[128];      // offset 4
-        //   u16 rd_size;       // offset 132
-        //   u16 bus;           // offset 134
-        //   u32 vendor;        // offset 136
-        //   u32 product;       // offset 140
-        //   u32 version;       // offset 144
-        //   u32 country;       // offset 148
-        //   u8 rd_data[HID_MAX_DESCRIPTOR_SIZE=4096]; // offset 152
+        // uhid_create2_req layout (packed, union starts at offset 4):
+        //   u8 name[128]   offset 4
+        //   u8 phys[64]    offset 132
+        //   u8 uniq[64]    offset 196
+        //   u16 rd_size    offset 260
+        //   u16 bus        offset 262
+        //   u32 vendor     offset 264
+        //   u32 product    offset 268
+        //   u32 version    offset 272
+        //   u32 country    offset 276
+        //   u8 rd_data[4096] offset 280
+        const BASE: usize = 4;
+        const RD_SIZE_OFF: usize = BASE + 128 + 64 + 64; // 260
+        const BUS_OFF: usize = RD_SIZE_OFF + 2;           // 262
+        const VENDOR_OFF: usize = BUS_OFF + 2;            // 264
+        const PRODUCT_OFF: usize = VENDOR_OFF + 4;        // 268
+        const VERSION_OFF: usize = PRODUCT_OFF + 4;       // 272
+        const COUNTRY_OFF: usize = VERSION_OFF + 4;       // 276
+        const RD_DATA_OFF: usize = COUNTRY_OFF + 4;       // 280
 
         let name = b"RustDesk Virtual FIDO Device";
-        let name_offset = 4;
-        buf[name_offset..name_offset + name.len()].copy_from_slice(name);
+        buf[BASE..BASE + name.len()].copy_from_slice(name);
 
-        // rd_size (u16 LE at offset 132)
         let rd_size = FIDO_HID_REPORT_DESCRIPTOR.len() as u16;
-        buf[132..134].copy_from_slice(&rd_size.to_le_bytes());
-
-        // bus: BUS_USB = 0x03 (u16 LE at offset 134)
-        buf[134..136].copy_from_slice(&3u16.to_le_bytes());
-
-        // vendor (u32 LE at offset 136)
-        buf[136..140].copy_from_slice(&(VIRTUAL_FIDO_VID as u32).to_le_bytes());
-
-        // product (u32 LE at offset 140)
-        buf[140..144].copy_from_slice(&(VIRTUAL_FIDO_PID as u32).to_le_bytes());
-
-        // version (u32 LE at offset 144)
-        buf[144..148].copy_from_slice(&1u32.to_le_bytes());
-
-        // country (u32 LE at offset 148) = 0
-        // rd_data starts at offset 152
-        let rd_offset = 152;
-        buf[rd_offset..rd_offset + FIDO_HID_REPORT_DESCRIPTOR.len()]
+        buf[RD_SIZE_OFF..RD_SIZE_OFF + 2].copy_from_slice(&rd_size.to_le_bytes());
+        buf[BUS_OFF..BUS_OFF + 2].copy_from_slice(&3u16.to_le_bytes()); // BUS_USB
+        buf[VENDOR_OFF..VENDOR_OFF + 4].copy_from_slice(&(VIRTUAL_FIDO_VID as u32).to_le_bytes());
+        buf[PRODUCT_OFF..PRODUCT_OFF + 4].copy_from_slice(&(VIRTUAL_FIDO_PID as u32).to_le_bytes());
+        buf[VERSION_OFF..VERSION_OFF + 4].copy_from_slice(&1u32.to_le_bytes());
+        // country at COUNTRY_OFF = 0 (already zeroed)
+        buf[RD_DATA_OFF..RD_DATA_OFF + FIDO_HID_REPORT_DESCRIPTOR.len()]
             .copy_from_slice(FIDO_HID_REPORT_DESCRIPTOR);
 
         let mut file = self.file.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
