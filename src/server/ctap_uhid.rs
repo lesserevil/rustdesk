@@ -111,23 +111,20 @@ impl VirtualFidoDevice for UhidFidoDevice {
             ]);
 
             if event_type == UHID_OUTPUT {
-                // UHID_OUTPUT event layout:
-                //   u32 type (offset 0)
-                //   u8 data[UHID_DATA_MAX=4096] (offset 4)
-                //   u16 size (offset 4+4096 = 4100)
-                //   u8 rtype (offset 4102)
-                //
-                // Actually for uhid_output_req:
-                //   u8 data[4096] at offset 4
-                //   u16 size at offset 4100
-                //   u8 rtype at offset 4102
+                // UHID_OUTPUT event: u8 data[4096] at offset 4, u16 size at 4100
+                // For FIDO devices without report IDs, the kernel prepends a 0x00
+                // report ID byte, making the actual HID report start at data[1].
                 let size = u16::from_le_bytes([event_buf[4100], event_buf[4101]]) as usize;
-                if size < 64 {
+                let mut report = [0u8; 64];
+                if size == 65 && event_buf[4] == 0x00 {
+                    // Report ID 0x00 prepended — skip it
+                    report.copy_from_slice(&event_buf[5..69]);
+                } else if size >= 64 {
+                    report.copy_from_slice(&event_buf[4..68]);
+                } else {
                     log::warn!("uhid output report too short: {} bytes", size);
                     continue;
                 }
-                let mut report = [0u8; 64];
-                report.copy_from_slice(&event_buf[4..68]);
                 return Ok(report);
             }
             // Ignore other event types (UHID_START, UHID_STOP, UHID_OPEN, UHID_CLOSE)
