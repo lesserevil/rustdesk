@@ -4,7 +4,7 @@
 /// authenticator to the browser. The browser writes CTAPHID output reports
 /// to the device, and we inject input reports (responses) back.
 use super::ctap_virtual_device::*;
-use hbb_common::{bail, log, ResultType};
+use hbb_common::{anyhow, bail, log, ResultType};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;

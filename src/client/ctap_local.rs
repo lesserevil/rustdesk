@@ -5,7 +5,7 @@
 /// the response. Uses ctap-common for CTAPHID framing and HID I/O.
 use ctap_common::ctap_hid::CTAPHID_CBOR;
 use ctap_common::fido_relay::{CtapRelayResult, LocalAuthenticator};
-use hbb_common::message_proto::CtapFrame;
+use hbb_common::{log, message_proto::CtapFrame, tokio};
 use std::time::Duration;
 
 /// Async wrapper that spawns a blocking thread for HID I/O.

@@ -7,7 +7,7 @@
 use crate::server::ctap_virtual_device::{self, VirtualFidoDevice};
 use ctap_common::ctap_hid::*;
 use hbb_common::{
-    log,
+    anyhow, log,
     message_proto::*,
     tokio::{
         self,
@@ -86,21 +86,20 @@ async fn run_event_loop(
     let mut client_deadline: Option<Instant> = None;
 
     loop {
-        // The uhid read is blocking, so we run it in a blocking thread.
-        // We use a channel to receive the result asynchronously.
-        let (report_tx, mut report_rx) = mpsc::channel::<ResultType<[u8; 64]>>(1);
-
-        // Spawn a blocking read task. This is re-spawned each loop iteration
-        // because we need to interleave with other async branches.
-        // Note: In production, a dedicated reader thread with a channel would be more efficient.
-        let device_ptr = device as *const dyn VirtualFidoDevice as usize;
-        tokio::task::spawn_blocking(move || {
-            // SAFETY: device lifetime is guaranteed by the caller (run_event_loop
-            // holds a reference). The blocking task completes before the next iteration.
-            let device: &dyn VirtualFidoDevice =
-                unsafe { &*(device_ptr as *const dyn VirtualFidoDevice) };
-            let result = device.read_output_report();
-            let _ = report_tx.blocking_send(result);
+        // The uhid read is blocking. We use spawn_blocking with a transmuted
+        // fat pointer to move the trait object reference into the blocking thread.
+        let report_result = tokio::task::spawn_blocking({
+            let device_raw: [usize; 2] = unsafe {
+                std::mem::transmute(device as *const dyn VirtualFidoDevice)
+            };
+            move || {
+                let device: &dyn VirtualFidoDevice = unsafe {
+                    std::mem::transmute::<[usize; 2], *const dyn VirtualFidoDevice>(device_raw)
+                        .as_ref()
+                        .unwrap()
+                };
+                device.read_output_report()
+            }
         });
 
         tokio::select! {
@@ -109,8 +108,8 @@ async fn run_event_loop(
                 return Ok(());
             }
 
-            Some(report_result) = report_rx.recv() => {
-                let report = report_result?;
+            result = report_result => {
+                let report = result??;
                 handle_uhid_report(
                     &report, device, tx_to_peer, assembler,
                     next_cid, active_cid, &mut client_deadline, config,
