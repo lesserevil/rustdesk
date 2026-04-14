@@ -98,7 +98,7 @@ class CtapModel extends ChangeNotifier {
     });
 
     try {
-      PlatformFFI.setByName('send_ctap_response', responseData);
+      ffiSetByName('send_ctap_response', responseData);
     } catch (e) {
       debugPrint('Failed to send CTAP response: $e');
     }
